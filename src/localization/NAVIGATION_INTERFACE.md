@@ -28,6 +28,10 @@ ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
 
 默认地图为安装在功能包中的 `maps/3_part.pcd`（众创空间五号楼整体地图）。
 也可通过 `map_pcd:=/absolute/path/to/global_map.pcd` 指定其他地图。
+若使用 Fast-LIO 持续累积的 `/Laser_map`，需传入
+`local_map_topic:=/Laser_map local_map_reliability:=reliable`；
+`scans.pcd` 可用工作空间根目录下的
+`map_pcd:="$PWD/src/localization/maps/scans.pcd"` 直接指定，无需安装该地图。
 地图文件作为部署数据，需在目标机器上单独复制；详见
 [`maps/README.md`](maps/README.md)。
 

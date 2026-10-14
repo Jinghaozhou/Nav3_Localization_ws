@@ -4,6 +4,7 @@
     odom_frame: odom
     base_frame: base_link
     local_map_topic: /local_map
+    local_map_reliability: best_effort
     voxel_resolution: 0.1
     max_local_map_age_sec: 10.0
     retry_interval_sec: 5.0

@@ -67,6 +67,8 @@ class NavigationLocalizer : public rclcpp::Node {
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     const auto map_pcd = declare_parameter<std::string>("map_pcd", "");
     const auto local_map_topic = declare_parameter<std::string>("local_map_topic", "/local_map");
+    const auto local_map_reliability =
+        declare_parameter<std::string>("local_map_reliability", "best_effort");
     voxel_resolution_ = declare_parameter<double>("voxel_resolution", 0.1);
     max_local_map_age_sec_ = declare_parameter<double>("max_local_map_age_sec", 10.0);
     retry_interval_sec_ = declare_parameter<double>("retry_interval_sec", 5.0);
@@ -80,7 +82,9 @@ class NavigationLocalizer : public rclcpp::Node {
         odom_frame_ == base_frame_ || voxel_resolution_ <= 0.0 ||
         max_local_map_age_sec_ < 0.0 || retry_interval_sec_ <= 0.0 ||
         periodic_interval_sec_ < 0.0 || max_auto_translation_m_ < 0.0 ||
-        max_auto_rotation_deg_ < 0.0 || candidate_timeout_sec_ <= 0.0) {
+        max_auto_rotation_deg_ < 0.0 || candidate_timeout_sec_ <= 0.0 ||
+        (local_map_reliability != "best_effort" &&
+         local_map_reliability != "reliable")) {
       throw std::invalid_argument("invalid navigation localization parameters");
     }
 
@@ -111,11 +115,29 @@ class NavigationLocalizer : public rclcpp::Node {
 
     rclcpp::SubscriptionOptions options;
     options.callback_group = input_group_;
+    rclcpp::QoS input_qos = rclcpp::SensorDataQoS();
+    if (local_map_reliability == "reliable") {
+      input_qos.reliable();
+    }
     local_map_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        local_map_topic, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
-          std::lock_guard<std::mutex> lock(input_mutex_);
-          latest_local_map_ = std::move(message);
+        local_map_topic, input_qos,
+        [this, local_map_topic](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+          const auto points = static_cast<std::size_t>(message->width) * message->height;
+          const auto frame = message->header.frame_id;
+          bool first_message = false;
+          {
+            std::lock_guard<std::mutex> lock(input_mutex_);
+            latest_local_map_ = std::move(message);
+            if (!first_local_map_logged_) {
+              first_local_map_logged_ = true;
+              first_message = true;
+            }
+          }
+          if (first_message) {
+            RCLCPP_INFO(get_logger(),
+                        "Local map received: topic=%s, frame=%s, points=%zu",
+                        local_map_topic.c_str(), frame.c_str(), points);
+          }
         }, options);
 
     rclcpp::QoS status_qos(1);
@@ -183,8 +205,11 @@ class NavigationLocalizer : public rclcpp::Node {
     filter.setInputCloud(full);
     map_cloud_.reset(new pcl::PointCloud<Point>());
     filter.filter(*map_cloud_);
-    RCLCPP_INFO(get_logger(), "Loaded map: %zu -> %zu points (%.3f m)",
-                full->size(), map_cloud_->size(), voxel_resolution_);
+    RCLCPP_INFO(get_logger(),
+                "Global map loaded: path=%s, frame=%s, points=%zu -> %zu "
+                "(voxel=%.3f m)",
+                path.c_str(), map_frame_.c_str(), full->size(), map_cloud_->size(),
+                voxel_resolution_);
   }
 
   Result newResult() {
@@ -238,6 +263,12 @@ class NavigationLocalizer : public rclcpp::Node {
         result.reason = "empty_voxelized_local_map";
         return result;
       }
+      RCLCPP_INFO(get_logger(),
+                  "Local map prepared: frame=%s, message_points=%zu, "
+                  "decoded_points=%zu, voxelized_points=%zu (voxel=%.3f m)",
+                  snapshot->header.frame_id.c_str(),
+                  static_cast<std::size_t>(snapshot->width) * snapshot->height,
+                  source->size(), sampled.size(), voxel_resolution_);
       const auto start = Clock::now();
       const auto registration = registration_->align(sampled, *map_cloud_);
       result.registration_ms =
@@ -297,10 +328,9 @@ class NavigationLocalizer : public rclcpp::Node {
         pending_ = PendingCandidate{result.candidate_id, candidate, result, Clock::now()};
       }
       RCLCPP_INFO(get_logger(),
-                  "Localization: %s; inliers=%u overlap=%.2f%% delta=%.3f m, %.2f deg, %.1f ms",
+                  "Localization: %s; inliers=%u overlap=%.2f%% delta=%.3f m, %.2f deg",
                   result.reason.c_str(), result.inliers, result.overlap_percent,
-                  result.translation_delta_m, result.rotation_delta_deg,
-                  result.registration_ms);
+                  result.translation_delta_m, result.rotation_delta_deg);
       return result;
     } catch (const std::exception &error) {
       result.reason = std::string("exception: ") + error.what();
@@ -388,6 +418,7 @@ class NavigationLocalizer : public rclcpp::Node {
   pcl::PointCloud<Point>::Ptr map_cloud_;
   std::unique_ptr<kiss_matcher::LocalizationRegistration> registration_;
   std::mutex input_mutex_;
+  bool first_local_map_logged_ = false;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_local_map_;
   std::mutex state_mutex_;
   bool has_applied_ = false;

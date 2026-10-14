@@ -1,6 +1,5 @@
 #include "localization/registration.h"
 
-#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -9,11 +8,6 @@
 
 namespace kiss_matcher {
 namespace {
-
-double milliseconds(std::chrono::steady_clock::time_point from,
-                    std::chrono::steady_clock::time_point to) {
-  return std::chrono::duration<double, std::milli>(to - from).count();
-}
 
 std::vector<Eigen::Vector3f> toPoints(const pcl::PointCloud<LocalizationPoint> &cloud) {
   std::vector<Eigen::Vector3f> points;
@@ -59,17 +53,13 @@ LocalizationResult LocalizationRegistration::refine(
     const pcl::PointCloud<LocalizationPoint> &target) {
   LocalizationResult result;
   fine_aligned_->clear();
-  const auto start = std::chrono::steady_clock::now();
   auto source_ptr = pcl::PointCloud<LocalizationPoint>::Ptr(
       new pcl::PointCloud<LocalizationPoint>(source));
   auto target_ptr = pcl::PointCloud<LocalizationPoint>::Ptr(
       new pcl::PointCloud<LocalizationPoint>(target));
-  const auto copied = std::chrono::steady_clock::now();
   fine_matcher_->setInputTarget(target_ptr);
   fine_matcher_->setInputSource(source_ptr);
-  const auto setup = std::chrono::steady_clock::now();
   fine_matcher_->align(*fine_aligned_);
-  const auto aligned = std::chrono::steady_clock::now();
 
   const auto &fine_result = fine_matcher_->getRegistrationResult();
   result.overlap_percent =
@@ -79,20 +69,15 @@ LocalizationResult LocalizationRegistration::refine(
     result.valid = true;
     result.converged = true;
   }
-  const auto evaluated = std::chrono::steady_clock::now();
   if (config_.verbose) {
-    RCLCPP_INFO(logger_,
-                "Timing VGICP (ms): cloud_copy=%.1f, setup=%.1f, optimize=%.1f, "
-                "evaluate=%.1f, total=%.1f",
-                milliseconds(start, copied), milliseconds(copied, setup),
-                milliseconds(setup, aligned), milliseconds(aligned, evaluated),
-                milliseconds(start, evaluated));
     if (result.valid) {
-      RCLCPP_INFO(logger_, "Overlapness: %.2f%% > %.2f%%",
-                  result.overlap_percent, config_.overlap_threshold);
+      RCLCPP_INFO(logger_, "VGICP accepted: overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
+                  result.overlap_percent, fine_result.num_inliers, source_ptr->size(),
+                  config_.overlap_threshold);
     } else {
-      RCLCPP_WARN(logger_, "Overlapness: %.2f%% <= %.2f%%",
-                  result.overlap_percent, config_.overlap_threshold);
+      RCLCPP_WARN(logger_, "VGICP rejected: overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
+                  result.overlap_percent, fine_result.num_inliers, source_ptr->size(),
+                  config_.overlap_threshold);
     }
   }
   return result;
@@ -104,12 +89,16 @@ LocalizationResult LocalizationRegistration::align(
   LocalizationResult result;
   coarse_aligned_->clear();
   fine_aligned_->clear();
-  const auto start = std::chrono::steady_clock::now();
   const auto source_points = toPoints(source);
   const auto target_points = toPoints(target);
-  const auto converted = std::chrono::steady_clock::now();
   const auto solution = coarse_matcher_->estimate(source_points, target_points);
-  const auto matched = std::chrono::steady_clock::now();
+  const auto initial_matches = coarse_matcher_->getInitialCorrespondences().size();
+  const auto pruned_matches = coarse_matcher_->getFinalCorrespondences().size();
+  // KISS does not run the solver when fewer than two pairs survive pruning.
+  const auto rotation_inliers =
+      pruned_matches >= 2 ? coarse_matcher_->getNumRotationInliers() : 0;
+  result.num_final_inliers =
+      pruned_matches >= 2 ? coarse_matcher_->getNumFinalInliers() : 0;
 
   Eigen::Matrix4d coarse = Eigen::Matrix4d::Identity();
   coarse.block<3, 3>(0, 0) = solution.rotation.cast<double>();
@@ -117,37 +106,28 @@ LocalizationResult LocalizationRegistration::align(
   if (!source.empty()) {
     pcl::transformPointCloud(source, *coarse_aligned_, coarse);
   }
-  const auto transformed = std::chrono::steady_clock::now();
-
   if (config_.verbose) {
+    const auto [source_features, target_features] =
+        coarse_matcher_->getKeypointsFromFasterPFH();
     RCLCPP_INFO(logger_,
-                "Timing KISS (ms): cloud_to_vector=%.1f, matcher=%.1f, "
-                "coarse_cloud_transform=%.1f, total=%.1f",
-                milliseconds(start, converted), milliseconds(converted, matched),
-                milliseconds(matched, transformed), milliseconds(start, transformed));
+                "KISS features: local=%zu/%zu points, global=%zu/%zu points",
+                source_features.size(), source_points.size(),
+                target_features.size(), target_points.size());
     RCLCPP_INFO(logger_,
-                "Timing KISS internals (ms): input=%.1f, FPFH=%.1f, "
-                "matching_and_pruning=%.1f, pruning_subset=%.1f, solver=%.1f",
-                coarse_matcher_->getProcessingTime() * 1000.0,
-                coarse_matcher_->getExtractionTime() * 1000.0,
-                coarse_matcher_->getMatchingTime() * 1000.0,
-                coarse_matcher_->getRejectionTime() * 1000.0,
-                coarse_matcher_->getSolverTime() * 1000.0);
+                "KISS matches: initial=%zu, after_pruning=%zu, "
+                "rotation_inliers=%zu, translation_inliers=%zu",
+                initial_matches, pruned_matches, rotation_inliers,
+                result.num_final_inliers);
   }
 
-  result.num_final_inliers = coarse_matcher_->getNumFinalInliers();
-  if (config_.verbose) {
-    if (result.num_final_inliers > config_.min_inliers) {
-      RCLCPP_INFO(logger_, "# final inliers: %zu > %zu",
-                  result.num_final_inliers, config_.min_inliers);
-    } else {
-      RCLCPP_WARN(logger_, "# final inliers: %zu < %zu",
-                  result.num_final_inliers, config_.min_inliers);
-    }
-  }
-  if (!solution.valid || result.num_final_inliers < config_.min_inliers) {
+  if (pruned_matches < 2 || !solution.valid ||
+      result.num_final_inliers < config_.min_inliers) {
     if (config_.verbose) {
-      RCLCPP_INFO(logger_, "Timing VGICP (ms): skipped (coarse alignment rejected)");
+      RCLCPP_WARN(logger_,
+                  "KISS rejected: solution_valid=%s, translation_inliers=%zu "
+                  "(required >= %zu); VGICP skipped",
+                  solution.valid ? "true" : "false", result.num_final_inliers,
+                  config_.min_inliers);
     }
     return result;
   }
@@ -156,10 +136,6 @@ LocalizationResult LocalizationRegistration::align(
   result = refine(*coarse_aligned_, target);
   result.num_final_inliers = inliers;
   result.target_T_source = result.target_T_source * coarse;
-  if (config_.verbose) {
-    RCLCPP_INFO(logger_, "Timing coarse-to-fine (ms): total=%.1f",
-                milliseconds(start, std::chrono::steady_clock::now()));
-  }
   return result;
 }
 

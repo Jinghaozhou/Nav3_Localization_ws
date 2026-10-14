@@ -76,6 +76,6 @@ install(TARGETS inter_frame_alignment navigation_localizer pcd_pointcloud_publis
   RUNTIME DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY maps/ DESTINATION share/${PROJECT_NAME}/maps
-  FILES_MATCHING PATTERN "*.pcd")
+  FILES_MATCHING PATTERN "*.pcd" PATTERN "scans.pcd" EXCLUDE)
 
 ament_package()

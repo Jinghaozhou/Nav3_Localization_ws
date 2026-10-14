@@ -4,7 +4,8 @@
 > 开发的独立 ROS 2 定位扩展，不属于 MIT-SPARK 官方项目。
 
 本目录用于从本地算法源码构建定位模块并验证部署。当前工作空间已在 ROS 2 Humble
-完成源码构建和 PCD 离线定位验证；真实 FastLIO 与导航系统尚未联调。
+完成源码构建和 PCD 离线定位验证，并验证了 Fast-LIO 局部地图话题接入；
+实时配准效果与导航系统仍待联调。
 
 定位实现参考 [MIT-SPARK/KISS-Matcher](https://github.com/MIT-SPARK/KISS-Matcher)。
 项目自有代码采用 [MIT 许可](LICENSE)；随附算法及第三方源码的来源、
@@ -76,13 +77,11 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
 ros2 launch localization_visualizer localization_visualizer.launch.yaml \
-  map_pcd:="$(ros2 pkg prefix kiss_matcher_localization)/share/kiss_matcher_localization/maps/3_part.pcd"
+  map_pcd:="$PWD/src/localization/maps/3_part.pcd"
 ```
 
 当前工作空间已包含全局地图 `src/localization/maps/3_part.pcd` 和调试点云
-`src/pcd_cloud_publisher/clouds/part_1_hard.pcd`。接入真实 FastLIO 时，
-不运行调试发布器；由 FastLIO 持续发布 `/local_map`（`odom` 坐标系）
-并提供 `odom → base_link`。完整导航接口见
+`src/pcd_cloud_publisher/clouds/part_1_hard.pcd`。完整导航接口见
 [导航接口文档](src/localization/NAVIGATION_INTERFACE.md)。
 
 上述两份 PCD 是本机验证数据，已被 Git 忽略；从 GitHub 克隆后需要自行
@@ -91,3 +90,42 @@ ros2 launch localization_visualizer localization_visualizer.launch.yaml \
 2026-10-12 的 Humble 离线测试中，首次定位成功应用：43 个 KISS 内点、
 99.69% VGICP 重叠率，`map → odom` 和对齐点云均已发布。调试 PCD 不提供
 `odom → base_link`，因此后续重定位虽匹配成功，但候选结果不会自动应用。
+
+## 4. 接入 Fast-LIO 局部地图
+
+Fast-LIO 发布 `/fast_lio/local_map`（点坐标与 `header.frame_id` 均为
+`odom`）及 `odom → base_link` TF 后，在工作空间根目录启动定位：
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
+ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
+  map_pcd:="$PWD/src/localization/maps/scans.pcd" \
+  local_map_topic:=/Laser_map \
+  local_map_reliability:=reliable
+```
+
+此处的 `scans.pcd` 是当前本机的全局地图文件，不随 Git 分发。运行时无需
+`pcd_cloud_publisher`；定位结果见 `/localization/status`，成功应用后发布
+`map → odom`。`/Laser_map` 是 Fast-LIO 持续累积的地图，体量会随运行增加；
+使用滑动窗口点云时改为 `local_map_topic:=/fast_lio/local_map` 并省略
+`local_map_reliability`。是否匹配成功取决于地图与实时点云的实际重叠情况。
+
+需要在匹配时观察两张点云，可构建 `localization_visualizer`，并在另一终端运行：
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch localization_visualizer localization_visualizer.launch.yaml \
+  map_pcd:="$PWD/src/localization/maps/scans.pcd" \
+  local_map_topic:=/Laser_map \
+  local_map_reliability:=reliable \
+  map_voxel_resolution:=0.3 \
+  local_voxel_resolution:=0.3
+```
+
+一个 RViz 窗口并排显示左侧全局图和右侧未对齐的原始局部图；
+匹配成功并发布 `map → odom` 后，左侧还会叠加对齐后的局部图。
+右侧为便于比较做了显示平移，不代表定位变换。
+详见[可视化包说明](src/localization_visualizer/README.md)。

@@ -2,12 +2,14 @@
 launch:
   - arg: {name: map_pcd, default: "", description: "Optional global map PCD in map frame"}
   - arg: {name: local_map_topic, default: "/local_map"}
+  - arg: {name: local_map_reliability, default: "best_effort", description: "best_effort or reliable"}
   - arg: {name: map_frame, default: "map"}
   - arg: {name: odom_frame, default: "odom"}
   - arg: {name: map_voxel_resolution, default: "0.2"}
   - arg: {name: local_voxel_resolution, default: "0.2"}
+  - arg: {name: comparison_gap_m, default: "10.0"}
   - arg: {name: start_rviz, default: "true"}
-  - arg: {name: rviz_path, default: $(find-pkg-share localization_visualizer)/rviz/localization.rviz}
+  - arg: {name: rviz_path, default: $(find-pkg-share localization_visualizer)/rviz/comparison.rviz}
 
   - node:
       pkg: localization_visualizer
@@ -18,10 +20,12 @@ launch:
       param:
         - {name: map_pcd, value: $(var map_pcd)}
         - {name: local_map_topic, value: $(var local_map_topic)}
+        - {name: local_map_reliability, value: $(var local_map_reliability)}
         - {name: map_frame, value: $(var map_frame)}
         - {name: odom_frame, value: $(var odom_frame)}
         - {name: map_voxel_resolution, value: $(var map_voxel_resolution)}
         - {name: local_voxel_resolution, value: $(var local_voxel_resolution)}
+        - {name: comparison_gap_m, value: $(var comparison_gap_m)}
 
   - node:
       if: $(var start_rviz)

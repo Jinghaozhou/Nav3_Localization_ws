@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -19,7 +21,7 @@ find_package(PCL REQUIRED COMPONENTS common filters io)
 add_executable(localization_visualizer_node src/localization_visualizer_node.cpp)
 target_include_directories(localization_visualizer_node PRIVATE ${PCL_INCLUDE_DIRS})
 ament_target_dependencies(localization_visualizer_node
-  rclcpp sensor_msgs visualization_msgs tf2 tf2_ros pcl_conversions)
+  rclcpp geometry_msgs sensor_msgs nav_msgs visualization_msgs tf2 tf2_ros pcl_conversions)
 target_link_libraries(localization_visualizer_node ${PCL_LIBRARIES})
 
 install(TARGETS localization_visualizer_node

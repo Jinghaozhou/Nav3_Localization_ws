@@ -1,6 +1,6 @@
 # 从源码构建独立工作空间
 
-在工作空间根目录操作。`src/` 放三个 ROS 2 包，
+在工作空间根目录操作。`src/` 放四个 ROS 2 包，
 `vendor/` 放算法源码，`external/` 是本机从源码编译后生成的安装前缀。
 `vendor/` 和 `external/` 不作为 ROS 包交给 colcon 构建。
 
@@ -40,7 +40,7 @@ patch -p1 -i src/localization/deployment/robin-local-sources.patch
 
 构建脚本先清除可能继承的旧工作空间 ROS/CMake 环境，再加载
 `/opt/ros/humble`。它依次从源码构建 ROBIN、KISS Matcher、small_gicp，
-安装到 `external/`，最后构建三个 ROS 2 包。
+安装到 `external/`，最后构建四个 ROS 2 包。
 移动工作空间后，应重新生成旧 CMake 构建缓存中的绝对路径。
 系统必须事先安装相应 ROS 2 发行版、CMake ≥ 3.22、编译工具、
 PCL、Eigen3、TBB、FLANN、LZ4、OpenMP 等依赖。
@@ -58,13 +58,14 @@ source install/setup.bash
 ros2 pkg prefix kiss_matcher_localization
 ros2 pkg prefix pcd_cloud_publisher
 ros2 pkg prefix localization_visualizer
+ros2 pkg prefix localization_path_recorder
 grep -E '^(robin|kiss_matcher|small_gicp)_DIR:' \
   build/kiss_matcher_localization/CMakeCache.txt
 ldd install/kiss_matcher_localization/lib/kiss_matcher_localization/navigation_localizer \
   | grep 'not found' || true
 ```
 
-三个包的前缀应都位于当前工作空间 `install/`；三个算法 CMake 包的路径
+四个包的前缀应都位于当前工作空间 `install/`；三个算法 CMake 包的路径
 应都位于当前工作空间 `external/lib/cmake/`；最后一个命令不应输出
 `not found`。检查后再按上一级 `DEPLOYMENT.md` 启动节点。
 

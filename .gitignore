@@ -2,6 +2,7 @@
 /build/
 /install/
 /log/
+/bags/
 
 # C++ algorithm build outputs and installed libraries
 /build_algorithms/

@@ -69,6 +69,26 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Localized path
+      Alpha: 1
+      Buffer Length: 1
+      Color: 255; 235; 0
+      Line Style: Billboards
+      Line Width: 0.35
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.35
+      Pose Style: None
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /localization/map_path
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 20; 20; 25

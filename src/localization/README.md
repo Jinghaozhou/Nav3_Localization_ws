@@ -34,7 +34,7 @@ bash src/localization/deployment/build_from_source.sh
 ```
 
 脚本依次构建算法库和本包、`pcd_cloud_publisher`、
-`localization_visualizer` 三个 ROS 包。算法库安装在 `external/`，
+`localization_visualizer`、`localization_path_recorder` 四个 ROS 包。算法库安装在 `external/`，
 ROS 包安装在 `install/`。详细构建依赖和检查方法见
 [从源码构建说明](deployment/README.md)。
 
@@ -62,6 +62,8 @@ ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
 PCD 离线调试的三包启动命令见[工作空间 README](../../README.md#3-使用-pcd-调试输入)。
 实时定位时，可视化包还能在一个 RViz 窗口并排显示全局图和
 尚未对齐的局部图；启动命令见[可视化包说明](../localization_visualizer/README.md)。
+定位成功后，可启动[轨迹记录包](../localization_path_recorder/README.md)，
+从 `map ← base_link` TF 发布 `/localization/map_path` 并叠加到可视化窗口的全局图上。
 
 启动日志会显示全局地图加载前后的点数；首次收到局部地图时记录话题、
 frame 和点数。每次配准会记录局部地图解码与降采样后的点数、两张地图
@@ -98,7 +100,7 @@ frame 和点数。每次配准会记录局部地图解码与降采样后的点�
 | `max_auto_rotation_deg` | `15.0`° | 已定位时自动应用新结果允许的最大旋转差 |
 | `candidate_timeout_sec` | `60.0` s | 未自动应用的候选结果可确认的时长；必须大于 0 |
 | `verbose` | `true` | 输出配准过程日志 |
-| `min_inliers` | `20` | KISS Matcher 粗配准的最少内点数；必须大于 0 |
+| `min_inliers` | `15` | KISS Matcher 粗配准的最少内点数；必须大于 0 |
 | `vgicp_threads` | `4` | VGICP 使用的线程数；必须大于 0 |
 | `vgicp_neighbors` | `20` | VGICP 邻域点数；必须大于 0 |
 | `vgicp_max_correspondence_scale` | `3.0` | VGICP 最大对应距离与 `voxel_resolution` 的倍率；必须大于 0 |

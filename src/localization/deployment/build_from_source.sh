@@ -54,4 +54,5 @@ cd "$workspace"
 export CMAKE_PREFIX_PATH="$prefix:${CMAKE_PREFIX_PATH:-}"
 export LD_LIBRARY_PATH="$prefix/lib:${LD_LIBRARY_PATH:-}"
 colcon build --packages-select \
-  kiss_matcher_localization pcd_cloud_publisher localization_visualizer
+  kiss_matcher_localization pcd_cloud_publisher localization_visualizer \
+  localization_path_recorder

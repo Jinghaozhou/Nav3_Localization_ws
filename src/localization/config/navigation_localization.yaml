@@ -13,7 +13,7 @@
     max_auto_rotation_deg: 15.0
     candidate_timeout_sec: 60.0
     verbose: true
-    min_inliers: 20
+    min_inliers: 15
     vgicp_threads: 4
     vgicp_neighbors: 20
     vgicp_max_correspondence_scale: 3.0

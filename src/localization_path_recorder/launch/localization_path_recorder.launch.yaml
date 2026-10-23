@@ -1,0 +1,24 @@
+---
+launch:
+  - arg: {name: map_frame, default: "map"}
+  - arg: {name: tracked_frame, default: "base_link"}
+  - arg: {name: sample_hz, default: "5.0"}
+  - arg: {name: min_distance_m, default: "0.05"}
+  - arg: {name: max_tf_age_sec, default: "1.0"}
+  - arg: {name: max_poses, default: "10000"}
+  - arg: {name: use_sim_time, default: "false"}
+
+  - node:
+      pkg: localization_path_recorder
+      exec: localization_path_recorder_node
+      namespace: localization
+      name: path_recorder
+      output: screen
+      param:
+        - {name: map_frame, value: $(var map_frame)}
+        - {name: tracked_frame, value: $(var tracked_frame)}
+        - {name: sample_hz, value: $(var sample_hz)}
+        - {name: min_distance_m, value: $(var min_distance_m)}
+        - {name: max_tf_age_sec, value: $(var max_tf_age_sec)}
+        - {name: max_poses, value: $(var max_poses)}
+        - {name: use_sim_time, value: $(var use_sim_time)}

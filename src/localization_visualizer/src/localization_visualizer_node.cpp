@@ -11,13 +11,16 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2/exceptions.h>
 #include <tf2/time.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 class LocalizationVisualizer : public rclcpp::Node {
  public:
@@ -28,6 +31,8 @@ class LocalizationVisualizer : public rclcpp::Node {
     comparison_gap_m_ = declare_parameter<double>("comparison_gap_m", 10.0);
     const auto map_pcd = declare_parameter<std::string>("map_pcd", "");
     const auto local_map_topic = declare_parameter<std::string>("local_map_topic", "/local_map");
+    const auto path_topic = declare_parameter<std::string>("path_topic", "/localization/map_path");
+    const auto pose_topic = declare_parameter<std::string>("pose_topic", "/localization/map_pose");
     const auto local_map_reliability =
         declare_parameter<std::string>("local_map_reliability", "best_effort");
     const double map_voxel = declare_parameter<double>("map_voxel_resolution", 0.2);
@@ -37,7 +42,8 @@ class LocalizationVisualizer : public rclcpp::Node {
         map_frame_ == odom_frame_ || comparison_frame_ == map_frame_ ||
         comparison_frame_ == odom_frame_ || !std::isfinite(comparison_gap_m_) ||
         comparison_gap_m_ <= 0.0 ||
-        local_map_topic.empty() || map_voxel <= 0.0 || local_voxel_resolution_ <= 0.0 ||
+        local_map_topic.empty() || path_topic.empty() || pose_topic.empty() ||
+        map_voxel <= 0.0 || local_voxel_resolution_ <= 0.0 ||
         !std::isfinite(local_publish_hz) || local_publish_hz <= 0.0 ||
         (local_map_reliability != "best_effort" &&
          local_map_reliability != "reliable")) {
@@ -60,6 +66,52 @@ class LocalizationVisualizer : public rclcpp::Node {
         "comparison/aligned_local_map", output_qos);
     comparison_labels_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
         "comparison/labels", output_qos);
+    comparison_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+        "comparison/map_path", output_qos);
+    comparison_pose_pub_ = create_publisher<visualization_msgs::msg::Marker>(
+        "comparison/current_pose", output_qos);
+
+    path_sub_ = create_subscription<nav_msgs::msg::Path>(
+        path_topic, output_qos,
+        [this](nav_msgs::msg::Path::ConstSharedPtr path) {
+          if (path->header.frame_id != map_frame_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Path frame is '%s', expected '%s'",
+                                 path->header.frame_id.c_str(), map_frame_.c_str());
+            return;
+          }
+          auto display = *path;
+          display.header.frame_id = comparison_frame_;
+          for (auto &pose : display.poses) pose.header.frame_id = comparison_frame_;
+          comparison_path_pub_->publish(display);
+        });
+    pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+        pose_topic, output_qos,
+        [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr pose) {
+          if (pose->header.frame_id != map_frame_) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Current pose frame is '%s', expected '%s'",
+                                 pose->header.frame_id.c_str(), map_frame_.c_str());
+            return;
+          }
+          visualization_msgs::msg::Marker arrow;
+          arrow.header.frame_id = comparison_frame_;
+          arrow.header.stamp = pose->header.stamp;
+          arrow.ns = "localized_robot";
+          arrow.id = 0;
+          arrow.type = visualization_msgs::msg::Marker::ARROW;
+          arrow.action = visualization_msgs::msg::Marker::ADD;
+          arrow.pose = pose->pose;
+          arrow.pose.position.z += 0.35;
+          arrow.scale.x = 2.0;
+          arrow.scale.y = 0.8;
+          arrow.scale.z = 0.8;
+          arrow.color.r = 1.0f;
+          arrow.color.g = 0.0f;
+          arrow.color.b = 0.8f;
+          arrow.color.a = 1.0f;
+          comparison_pose_pub_->publish(arrow);
+        });
 
     rclcpp::QoS input_qos = rclcpp::SensorDataQoS();
     if (local_map_reliability == "reliable") {
@@ -255,7 +307,11 @@ class LocalizationVisualizer : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr comparison_local_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr comparison_aligned_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr comparison_labels_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr comparison_path_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr comparison_pose_pub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr local_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
   rclcpp::TimerBase::SharedPtr map_timer_;
   rclcpp::TimerBase::SharedPtr local_timer_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

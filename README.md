@@ -16,6 +16,7 @@
 - `src/localization/`：定位节点、服务、全局地图和部署文档。
 - `src/pcd_cloud_publisher/`：调试用 `/local_map` 发布节点。
 - `src/localization_visualizer/`：独立可视化节点和 RViz 配置。
+- `src/localization_path_recorder/`：从 TF 记录全局地图中的定位轨迹。
 - `vendor/`：KISS Matcher、ROBIN、small_gicp、PMC、xenium 源码。
 - `external/`：构建脚本将在此安装算法头文件和库。
 
@@ -30,7 +31,7 @@ Eigen3、TBB、FLANN、LZ4 和 OpenMP。ROBIN 的本地源码补丁已经应用�
 bash src/localization/deployment/build_from_source.sh
 ```
 
-脚本加载 `/opt/ros/humble`，依次构建三个算法库和三个 ROS 包；
+脚本加载 `/opt/ros/humble`，依次构建三个算法库和四个 ROS 包；
 构建结果分别位于 `build_algorithms/`、`external/`、`build/` 和
 `install/`。迁移工作空间后，旧 CMake 构建缓存中的绝对路径需要重新生成。
 不要在构建前 source 旧 KISS-Matcher 工作空间。详细源码版本、
@@ -47,11 +48,12 @@ source install/setup.bash
 ros2 pkg prefix kiss_matcher_localization
 ros2 pkg prefix pcd_cloud_publisher
 ros2 pkg prefix localization_visualizer
+ros2 pkg prefix localization_path_recorder
 grep -E '^(robin|kiss_matcher|small_gicp)_DIR:' \
   build/kiss_matcher_localization/CMakeCache.txt
 ```
 
-前三项应都指向本工作空间的 `install/`，最后三项应指向
+前四项应都指向本工作空间的 `install/`，最后三项应指向
 `external/lib/cmake/`。检查动态库的命令也见源码构建说明。
 
 ## 3. 使用 PCD 调试输入
@@ -129,3 +131,51 @@ ros2 launch localization_visualizer localization_visualizer.launch.yaml \
 匹配成功并发布 `map → odom` 后，左侧还会叠加对齐后的局部图。
 右侧为便于比较做了显示平移，不代表定位变换。
 详见[可视化包说明](src/localization_visualizer/README.md)。
+
+需要显示定位成功后的运动轨迹时，另开终端启动路径记录包：
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch localization_path_recorder localization_path_recorder.launch.yaml
+```
+
+节点在 `map → base_link` TF 可用后发布 `map` 坐标系的
+`/localization/map_path`；上面的 RViz 窗口会在左侧全局地图上用醒目的
+黄色轨迹和紫红色当前位置箭头显示它。定位尚未成功、TF 链不完整时不会
+生成轨迹。详见[路径记录包说明](src/localization_path_recorder/README.md)。
+
+### 录制本次测试
+
+在本工作空间根目录、与雷达和 Fast-LIO 相同 `ROS_DOMAIN_ID` 的终端，
+**先启动录包，再开始扫描**：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ../Fast_lio_ws/install/setup.bash
+mkdir -p bags
+ros2 bag record -o "bags/stair_10m_$(date +%Y%m%d_%H%M%S)" \
+  /lidar_points /imu /Laser_map /fast_lio/odom /tf /tf_static \
+  /localization/map_path /localization/map_pose
+```
+
+测试结束后在录包终端按 **Ctrl-C**，等待写盘完成，再用
+`ros2 bag info bags/实际生成的目录名` 核对各话题消息数，尤其是
+`/lidar_points`、`/imu` 和 `/Laser_map`。`bags/` 已被 Git 忽略。
+`/Laser_map` 是累计地图，每条消息会随扫描时间增长；录制期间留意磁盘空间。
+本次将 FAST-LIO 的最远处理距离调为 10 米，不影响 `/lidar_points` 的
+原始数据，因此以后还可以用同一个包重跑不同的 FAST-LIO 距离参数。
+
+回去只调定位参数时，可启动定位节点，将其 `use_sim_time` 设为 `true`，
+然后只回放累计地图；这足以重复 KISS 与 VGICP 的匹配计算：
+
+```bash
+ros2 param set /localization/navigation_localizer use_sim_time true
+ros2 bag play bags/实际生成的目录名 --clock 100 --topics /Laser_map
+```
+
+先设置 `use_sim_time`，再启动回放，否则历史点云可能被
+`max_local_map_age_sec` 判为过期。只回放 `/Laser_map` 不提供
+`odom → base_link`，候选位姿可能无法自动应用；要连同建图一起重跑，
+按 Fast-LIO 工作空间的离线回放说明启动 `driver:=false use_sim_time:=true`，
+仅回放 `/lidar_points`、`/imu`，同时让播放器发布 `/clock`。

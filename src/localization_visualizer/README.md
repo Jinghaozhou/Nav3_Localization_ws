@@ -20,11 +20,17 @@
 | `/localization_visualization/comparison/local_map` | `localization_comparison` | 右侧原始局部图，平移到全局图右侧 |
 | `/localization_visualization/comparison/aligned_local_map` | `localization_comparison` | 定位成功后叠加在左侧的配准结果 |
 | `/localization_visualization/comparison/labels` | `localization_comparison` | 两侧文字标签 |
+| `/localization_visualization/comparison/map_path` | `localization_comparison` | 左侧全局地图上的定位轨迹显示副本 |
+| `/localization_visualization/comparison/current_pose` | `localization_comparison` | 左侧当前位置箭头 |
 
 `localization_comparison` 是专用显示画布，不是机器人实际坐标系；右侧平移
 不代表定位结果，也不要用这个话题计算位姿。右侧点云会随累计范围变化
 重新平移，以保持它与左侧至少相隔 `comparison_gap_m`（默认 10 m）。
 两侧点云共用一个相机视角，不能单独旋转或缩放其中一侧。
+如果启动 [`localization_path_recorder`](../localization_path_recorder/README.md)，
+可视化节点还会订阅 `map` frame 的 `/localization/map_path` 和
+`/localization/map_pose`。默认 RViz 在左侧显示黄色粗轨迹与紫红色箭头；
+线条和箭头只向上偏移 `0.35 m` 以免被点云遮挡，原始轨迹坐标不变。
 
 输入局部点云的 `header.frame_id` 必须是 `odom`。节点只读取 TF，
 不会发布 TF，也不会影响定位结果。所有可视化输出使用 reliable +
@@ -58,6 +64,8 @@ ros2 launch localization_visualizer localization_visualizer.launch.yaml \
   map_voxel_resolution:=0.3 \
   local_voxel_resolution:=0.3
 ```
+
+轨迹需要单独启动 `localization_path_recorder`；可视化包没有该包的编译依赖。
 
 `/Laser_map` 是可靠发布的大点云，故此处指定可靠订阅，并用 `0.3 m`
 体素降低 RViz 负载。启动后左侧灰色地图和右侧橙色点云并排显示；

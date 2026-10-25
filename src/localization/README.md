@@ -1,8 +1,9 @@
 # KISS Matcher 点云定位 ROS 2 包
 
 `kiss_matcher_localization` 将 `odom` 坐标系中的局部点云与 `map` 坐标系中的
-全局 PCD 地图配准，计算并发布 `map → odom`。配准先使用 KISS Matcher
-寻找初始位姿，再使用 VGICP 精配准，并按内点数和重叠率检查结果。
+全局 PCD 地图配准，计算并发布 `map → odom`。首次使用 KISS Matcher
+寻找初始位姿，再使用 VGICP 精配准；已有定位时优先用 TF 先验直接运行
+VGICP，失败则回退到 KISS + VGICP。
 
 包内有两个运行入口：`navigation_localizer` 用于持续定位和重定位服务；
 `inter_frame_alignment` 用于两路点云之间的配准演示。导航定位时启动前者。
@@ -65,10 +66,17 @@ PCD 离线调试的三包启动命令见[工作空间 README](../../README.md#3-
 定位成功后，可启动[轨迹记录包](../localization_path_recorder/README.md)，
 从 `map ← base_link` TF 发布 `/localization/map_path` 并叠加到可视化窗口的全局图上。
 
+自动定位在首次启动和未定位时使用全局模式；首次成功应用后，周期定位
+直接读取 `map ← odom` TF 作为局部模式的初值。局部模式
+跳过 KISS，直接运行 VGICP；TF 不可用或局部配准被拒绝时，自动用同一帧
+局部地图回退到全局模式。两种模式的结果都经过原有的自动应用和位姿跳变检查。
+手动服务可明确选择全局或局部模式，详见[导航接口说明](NAVIGATION_INTERFACE.md)。
+
 启动日志会显示全局地图加载前后的点数；首次收到局部地图时记录话题、
 frame 和点数。每次配准会记录局部地图解码与降采样后的点数、两张地图
-提取的 KISS 特征点数、初始与筛选后的对应点数、旋转与平移内点数，
-以及 VGICP 的重叠点数。终端不再逐项打印计算耗时；
+提取的 KISS 特征点数、初始与筛选后的对应点数、旋转与平移内点数
+（仅全局模式），以及 VGICP 的重叠点数和收敛状态。终端还会显示使用的
+模式和是否回退；不再逐项打印计算耗时；
 `/localization/status` 中仍保留 `registration_ms` 供需要时查看。
 
 ### 启动参数与配置文件
@@ -94,19 +102,22 @@ frame 和点数。每次配准会记录局部地图解码与降采样后的点�
 | --- | --- | --- |
 | `voxel_resolution` | `0.1` m | 全局图和局部图的体素大小；必须大于 0 |
 | `max_local_map_age_sec` | `10.0` s | 局部图时间戳允许的最大年龄；设为 `0.0` 关闭此项检查 |
-| `retry_interval_sec` | `5.0` s | 首次定位成功前的自动重试间隔；必须大于 0 |
+| `max_prior_tf_age_sec` | `1.0` s | 局部配准的 TF 初值允许的最大年龄；必须大于 0 |
+| `retry_interval_sec` | `5.0` s | 首次定位或已定位后配准失败时的自动重试间隔；必须大于 0 |
 | `periodic_interval_sec` | `60.0` s | 已定位后的自动重定位间隔；设为 `0.0` 关闭周期重定位 |
 | `max_auto_translation_m` | `1.0` m | 已定位时自动应用新结果允许的最大平移差 |
 | `max_auto_rotation_deg` | `15.0`° | 已定位时自动应用新结果允许的最大旋转差 |
+| `local_max_correction_translation_m` | `1.0` m | 局部 VGICP 结果相对 TF 初值允许的最大平移修正 |
+| `local_max_correction_rotation_deg` | `15.0`° | 局部 VGICP 结果相对 TF 初值允许的最大旋转修正 |
 | `candidate_timeout_sec` | `60.0` s | 未自动应用的候选结果可确认的时长；必须大于 0 |
 | `verbose` | `true` | 输出配准过程日志 |
 | `min_inliers` | `15` | KISS Matcher 粗配准的最少内点数；必须大于 0 |
 | `vgicp_threads` | `4` | VGICP 使用的线程数；必须大于 0 |
 | `vgicp_neighbors` | `20` | VGICP 邻域点数；必须大于 0 |
 | `vgicp_max_correspondence_scale` | `3.0` | VGICP 最大对应距离与 `voxel_resolution` 的倍率；必须大于 0 |
-| `min_overlap_percent` | `70.0`% | VGICP 重叠率阈值；取值范围为 0–100，实际接受条件为重叠率高于阈值 |
+| `min_overlap_percent` | `70.0`% | VGICP 重叠率阈值；取值范围为 0–100，须收敛且重叠率高于阈值 |
 
-`map_pcd`、`local_map_topic` 和三个坐标系名称也可写在 YAML 中，但启动文件
+`map_pcd`、`local_map_topic` 和各坐标系名称也可写在 YAML 中，但启动文件
 会用同名 launch 参数覆盖它们。因此只修改 YAML 里的
 `local_map_topic: /fast_lio/local_map` 不会改变默认启动时的订阅话题，需同时
 传入 `local_map_topic:=/fast_lio/local_map`。修改包内源码目录的配置文件后，
@@ -120,8 +131,9 @@ ros2 param get /localization/navigation_localizer local_map_topic
 ros2 param get /localization/navigation_localizer min_overlap_percent
 ```
 
-局部地图来自真实设备时，需同时保证 `odom_frame → base_frame` TF 可用，
-以便在已有定位后比较新旧机器人位姿；详细应用规则见
+局部地图来自真实设备时，需保证本节点已发布 `map → odom` 作为局部
+配准初值；还需 `odom_frame → base_frame` 来比较新旧机器人位姿。
+详细应用规则见
 [导航接口说明](NAVIGATION_INTERFACE.md)。
 
 检查定位结果：
@@ -139,7 +151,7 @@ source install/setup.bash
 export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
 ros2 service call /localization/relocalize \
   kiss_matcher_localization/srv/Relocalize \
-  "{apply_if_safe: true}"
+  "{mode: 1, apply_if_safe: true}"  # 1=全局，2=局部，0=自动
 ```
 
 首次匹配通过质量检查后可以直接应用。已有定位时，若缺少

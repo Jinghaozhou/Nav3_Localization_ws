@@ -41,6 +41,9 @@ class LocalizationRegistration {
                               const pcl::PointCloud<LocalizationPoint> &target);
   LocalizationResult align(const pcl::PointCloud<LocalizationPoint> &source,
                            const pcl::PointCloud<LocalizationPoint> &target);
+  LocalizationResult alignLocal(const pcl::PointCloud<LocalizationPoint> &source,
+                                const pcl::PointCloud<LocalizationPoint> &target,
+                                const Eigen::Matrix4d &initial_guess);
 
   pcl::PointCloud<LocalizationPoint> getSourceCloud() const;
   pcl::PointCloud<LocalizationPoint> getTargetCloud() const;

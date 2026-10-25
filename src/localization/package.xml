@@ -2,7 +2,7 @@
 <package format="3">
   <name>kiss_matcher_localization</name>
   <version>0.1.0</version>
-  <description>Coarse-to-fine point cloud localization using KISS Matcher and VGICP</description>
+  <description>Global KISS and prior-guided local VGICP point cloud localization</description>
   <maintainer email="zhoujinghao188@gmail.com">Jinghao</maintainer>
   <license>MIT</license>
 

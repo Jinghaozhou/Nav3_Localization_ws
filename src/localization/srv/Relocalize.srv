@@ -1,4 +1,10 @@
 # Compute a candidate from the latest /local_map snapshot.
+# AUTO follows the automatic strategy; GLOBAL always runs KISS + VGICP;
+# LOCAL requires an applied pose and runs VGICP only, without fallback.
+uint8 AUTO=0
+uint8 GLOBAL=1
+uint8 LOCAL=2
+uint8 mode
 # When true, apply it if it passes quality and jump thresholds.
 bool apply_if_safe
 ---

@@ -57,6 +57,31 @@ double rotationDegrees(const Eigen::Matrix3d &rotation) {
   return std::acos(cosine) * 180.0 / std::acos(-1.0);
 }
 
+enum class Mode { Auto, Global, Local };
+
+const char *modeName(Mode mode) {
+  switch (mode) {
+    case Mode::Auto: return "auto";
+    case Mode::Global: return "global";
+    case Mode::Local: return "local";
+  }
+  return "invalid";
+}
+
+Eigen::Matrix4d transformMatrix(const geometry_msgs::msg::TransformStamped &message) {
+  const auto &t = message.transform.translation;
+  const auto &r = message.transform.rotation;
+  const Eigen::Quaterniond q(r.w, r.x, r.y, r.z);
+  if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z) ||
+      !q.coeffs().allFinite() || q.norm() < 1e-6) {
+    throw std::invalid_argument("invalid TF transform used as local prior");
+  }
+  Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+  pose.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+  pose.block<3, 1>(0, 3) = Eigen::Vector3d(t.x, t.y, t.z);
+  return pose;
+}
+
 }  // namespace
 
 class NavigationLocalizer : public rclcpp::Node {
@@ -71,18 +96,30 @@ class NavigationLocalizer : public rclcpp::Node {
         declare_parameter<std::string>("local_map_reliability", "best_effort");
     voxel_resolution_ = declare_parameter<double>("voxel_resolution", 0.1);
     max_local_map_age_sec_ = declare_parameter<double>("max_local_map_age_sec", 10.0);
+    max_prior_tf_age_sec_ = declare_parameter<double>("max_prior_tf_age_sec", 1.0);
     retry_interval_sec_ = declare_parameter<double>("retry_interval_sec", 5.0);
     periodic_interval_sec_ = declare_parameter<double>("periodic_interval_sec", 60.0);
     max_auto_translation_m_ = declare_parameter<double>("max_auto_translation_m", 1.0);
     max_auto_rotation_deg_ = declare_parameter<double>("max_auto_rotation_deg", 15.0);
+    local_max_correction_translation_m_ =
+        declare_parameter<double>("local_max_correction_translation_m", 1.0);
+    local_max_correction_rotation_deg_ =
+        declare_parameter<double>("local_max_correction_rotation_deg", 15.0);
     candidate_timeout_sec_ = declare_parameter<double>("candidate_timeout_sec", 60.0);
 
     if (map_pcd.empty() || map_frame_.empty() || odom_frame_.empty() ||
         base_frame_.empty() || map_frame_ == odom_frame_ ||
         odom_frame_ == base_frame_ || voxel_resolution_ <= 0.0 ||
-        max_local_map_age_sec_ < 0.0 || retry_interval_sec_ <= 0.0 ||
+        max_local_map_age_sec_ < 0.0 ||
+        !std::isfinite(max_prior_tf_age_sec_) || max_prior_tf_age_sec_ <= 0.0 ||
+        retry_interval_sec_ <= 0.0 ||
         periodic_interval_sec_ < 0.0 || max_auto_translation_m_ < 0.0 ||
-        max_auto_rotation_deg_ < 0.0 || candidate_timeout_sec_ <= 0.0 ||
+        max_auto_rotation_deg_ < 0.0 ||
+        !std::isfinite(local_max_correction_translation_m_) ||
+        local_max_correction_translation_m_ <= 0.0 ||
+        !std::isfinite(local_max_correction_rotation_deg_) ||
+        local_max_correction_rotation_deg_ <= 0.0 ||
+        candidate_timeout_sec_ <= 0.0 ||
         (local_map_reliability != "best_effort" &&
          local_map_reliability != "reliable")) {
       throw std::invalid_argument("invalid navigation localization parameters");
@@ -154,7 +191,14 @@ class NavigationLocalizer : public rclcpp::Node {
         [this](const std::shared_ptr<Relocalize::Request> request,
                std::shared_ptr<Relocalize::Response> response) {
           last_attempt_ = Clock::now();
-          response->result = runLocalization(request->apply_if_safe);
+          if (request->mode > Relocalize::Request::LOCAL) {
+            response->result = newResult();
+            response->result.requested_mode = "invalid";
+            response->result.reason = "invalid_mode";
+          } else {
+            response->result = runLocalization(static_cast<Mode>(request->mode),
+                                               request->apply_if_safe);
+          }
           response->result.completed_stamp = get_clock()->now();
           status_pub_->publish(response->result);
         },
@@ -223,9 +267,10 @@ class NavigationLocalizer : public rclcpp::Node {
     return result;
   }
 
-  Result runLocalization(bool apply_if_safe) {
+  Result runLocalization(Mode requested_mode, bool apply_if_safe) {
     pending_.reset();
     Result result = newResult();
+    result.requested_mode = modeName(requested_mode);
     sensor_msgs::msg::PointCloud2::ConstSharedPtr snapshot;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
@@ -270,13 +315,78 @@ class NavigationLocalizer : public rclcpp::Node {
                   static_cast<std::size_t>(snapshot->width) * snapshot->height,
                   source->size(), sampled.size(), voxel_resolution_);
       const auto start = Clock::now();
-      const auto registration = registration_->align(sampled, *map_cloud_);
+      kiss_matcher::LocalizationResult registration;
+      const bool try_local = requested_mode == Mode::Local ||
+          (requested_mode == Mode::Auto && result.has_previous);
+      if (try_local) {
+        if (!result.has_previous) {
+          result.reason = "no_local_prior";
+          return result;
+        }
+        std::string local_failure;
+        try {
+          const auto map_to_odom = tf_buffer_->lookupTransform(
+              map_frame_, odom_frame_, tf2::TimePointZero,
+              tf2::durationFromSec(0.2));
+          const rclcpp::Time prior_stamp(map_to_odom.header.stamp);
+          const double prior_age = (get_clock()->now() - prior_stamp).seconds();
+          if (prior_stamp.nanoseconds() == 0 || prior_age > max_prior_tf_age_sec_ ||
+              prior_age < -1.0) {
+            throw std::runtime_error("local prior TF is stale or future-dated");
+          }
+          const Eigen::Matrix4d initial_guess = transformMatrix(map_to_odom);
+          result.actual_mode = "local";
+          registration = registration_->alignLocal(sampled, *map_cloud_, initial_guess);
+          if (registration.valid) {
+            const Eigen::Matrix4d correction =
+                initial_guess.inverse() * registration.target_T_source;
+            const double translation = correction.block<3, 1>(0, 3).norm();
+            const double rotation = rotationDegrees(correction.block<3, 3>(0, 0));
+            if (!std::isfinite(translation) || !std::isfinite(rotation) ||
+                translation > local_max_correction_translation_m_ ||
+                rotation > local_max_correction_rotation_deg_) {
+              registration.valid = false;
+              local_failure = "local_correction_exceeds_limit";
+            }
+          }
+          if (!registration.valid && local_failure.empty()) {
+            local_failure = "local_registration_rejected";
+          }
+        } catch (const std::exception &error) {
+          registration.valid = false;
+          local_failure = "local_prior_or_registration_unavailable";
+          RCLCPP_WARN(get_logger(), "Local localization unavailable: %s", error.what());
+        }
+        if (!registration.valid && requested_mode == Mode::Local) {
+          result.registration_ms = std::chrono::duration<double, std::milli>(
+              Clock::now() - start).count();
+          result.overlap_percent = registration.overlap_percent;
+          result.reason = local_failure;
+          RCLCPP_WARN(get_logger(), "Localization rejected: mode=local reason=%s overlap=%.2f%%",
+                      result.reason.c_str(), result.overlap_percent);
+          return result;
+        }
+        if (!registration.valid) {
+          result.fallback_used = true;
+          result.fallback_reason = local_failure;
+          RCLCPP_WARN(get_logger(), "Local localization failed (%s); trying global KISS + VGICP",
+                      local_failure.c_str());
+        }
+      }
+      if (!try_local || !registration.valid) {
+        result.actual_mode = "global";
+        registration = registration_->align(sampled, *map_cloud_);
+      }
       result.registration_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - start).count();
       result.inliers = static_cast<std::uint32_t>(registration.num_final_inliers);
       result.overlap_percent = registration.overlap_percent;
       if (!registration.valid) {
         result.reason = "registration_rejected";
+        RCLCPP_WARN(get_logger(),
+                    "Localization rejected: mode=%s fallback=%s inliers=%u overlap=%.2f%%",
+                    result.actual_mode.c_str(), result.fallback_used ? "true" : "false",
+                    result.inliers, result.overlap_percent);
         return result;
       }
 
@@ -328,7 +438,8 @@ class NavigationLocalizer : public rclcpp::Node {
         pending_ = PendingCandidate{result.candidate_id, candidate, result, Clock::now()};
       }
       RCLCPP_INFO(get_logger(),
-                  "Localization: %s; inliers=%u overlap=%.2f%% delta=%.3f m, %.2f deg",
+                  "Localization: mode=%s fallback=%s result=%s; inliers=%u overlap=%.2f%% delta=%.3f m, %.2f deg",
+                  result.actual_mode.c_str(), result.fallback_used ? "true" : "false",
                   result.reason.c_str(), result.inliers, result.overlap_percent,
                   result.translation_delta_m, result.rotation_delta_deg);
       return result;
@@ -348,6 +459,7 @@ class NavigationLocalizer : public rclcpp::Node {
       result.last_success_stamp = last_success_stamp_;
     }
     result.applied = true;
+    last_auto_failed_ = false;
     publishTf();
   }
 
@@ -380,7 +492,8 @@ class NavigationLocalizer : public rclcpp::Node {
       initialized = has_applied_;
     }
     if (initialized && periodic_interval_sec_ == 0.0) return;
-    const double interval = initialized ? periodic_interval_sec_ : retry_interval_sec_;
+    const double interval = initialized && !last_auto_failed_ ?
+        periodic_interval_sec_ : retry_interval_sec_;
     if (last_attempt_ &&
         std::chrono::duration<double>(now - *last_attempt_).count() < interval) return;
     {
@@ -388,7 +501,10 @@ class NavigationLocalizer : public rclcpp::Node {
       if (!latest_local_map_) return;
     }
     last_attempt_ = now;
-    auto result = runLocalization(true);
+    auto result = runLocalization(initialized ? Mode::Auto : Mode::Global, true);
+    // Keep a matched-but-unapplied candidate available for review instead of
+    // replacing it at the short failure-retry interval.
+    last_auto_failed_ = !result.matched;
     result.completed_stamp = get_clock()->now();
     status_pub_->publish(result);
   }
@@ -409,10 +525,13 @@ class NavigationLocalizer : public rclcpp::Node {
   std::string base_frame_;
   double voxel_resolution_ = 0.1;
   double max_local_map_age_sec_ = 10.0;
+  double max_prior_tf_age_sec_ = 1.0;
   double retry_interval_sec_ = 5.0;
   double periodic_interval_sec_ = 60.0;
   double max_auto_translation_m_ = 1.0;
   double max_auto_rotation_deg_ = 15.0;
+  double local_max_correction_translation_m_ = 1.0;
+  double local_max_correction_rotation_deg_ = 15.0;
   double candidate_timeout_sec_ = 60.0;
 
   pcl::PointCloud<Point>::Ptr map_cloud_;
@@ -425,6 +544,7 @@ class NavigationLocalizer : public rclcpp::Node {
   Eigen::Matrix4d applied_map_T_odom_ = Eigen::Matrix4d::Identity();
   rclcpp::Time last_success_stamp_;
   std::optional<Clock::time_point> last_attempt_;
+  bool last_auto_failed_ = false;
   std::optional<PendingCandidate> pending_;
   std::uint64_t candidate_sequence_ = 0;
 

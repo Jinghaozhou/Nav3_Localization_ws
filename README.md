@@ -113,6 +113,9 @@ ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
 `map → odom`。`/Laser_map` 是 Fast-LIO 持续累积的地图，体量会随运行增加；
 使用滑动窗口点云时改为 `local_map_topic:=/fast_lio/local_map` 并省略
 `local_map_reliability`。是否匹配成功取决于地图与实时点云的实际重叠情况。
+首次定位使用 KISS + VGICP；成功后周期定位优先以 TF 位姿为初值运行
+VGICP，失败再回退全局匹配。局部模式直接读取已有的 `map → odom` TF；
+服务可指定全局或局部模式，见[导航接口文档](src/localization/NAVIGATION_INTERFACE.md)。
 
 需要在匹配时观察两张点云，可构建 `localization_visualizer`，并在另一终端运行：
 
@@ -144,38 +147,3 @@ ros2 launch localization_path_recorder localization_path_recorder.launch.yaml
 `/localization/map_path`；上面的 RViz 窗口会在左侧全局地图上用醒目的
 黄色轨迹和紫红色当前位置箭头显示它。定位尚未成功、TF 链不完整时不会
 生成轨迹。详见[路径记录包说明](src/localization_path_recorder/README.md)。
-
-### 录制本次测试
-
-在本工作空间根目录、与雷达和 Fast-LIO 相同 `ROS_DOMAIN_ID` 的终端，
-**先启动录包，再开始扫描**：
-
-```bash
-source /opt/ros/humble/setup.bash
-source ../Fast_lio_ws/install/setup.bash
-mkdir -p bags
-ros2 bag record -o "bags/stair_10m_$(date +%Y%m%d_%H%M%S)" \
-  /lidar_points /imu /Laser_map /fast_lio/odom /tf /tf_static \
-  /localization/map_path /localization/map_pose
-```
-
-测试结束后在录包终端按 **Ctrl-C**，等待写盘完成，再用
-`ros2 bag info bags/实际生成的目录名` 核对各话题消息数，尤其是
-`/lidar_points`、`/imu` 和 `/Laser_map`。`bags/` 已被 Git 忽略。
-`/Laser_map` 是累计地图，每条消息会随扫描时间增长；录制期间留意磁盘空间。
-本次将 FAST-LIO 的最远处理距离调为 10 米，不影响 `/lidar_points` 的
-原始数据，因此以后还可以用同一个包重跑不同的 FAST-LIO 距离参数。
-
-回去只调定位参数时，可启动定位节点，将其 `use_sim_time` 设为 `true`，
-然后只回放累计地图；这足以重复 KISS 与 VGICP 的匹配计算：
-
-```bash
-ros2 param set /localization/navigation_localizer use_sim_time true
-ros2 bag play bags/实际生成的目录名 --clock 100 --topics /Laser_map
-```
-
-先设置 `use_sim_time`，再启动回放，否则历史点云可能被
-`max_local_map_age_sec` 判为过期。只回放 `/Laser_map` 不提供
-`odom → base_link`，候选位姿可能无法自动应用；要连同建图一起重跑，
-按 Fast-LIO 工作空间的离线回放说明启动 `driver:=false use_sim_time:=true`，
-仅回放 `/lidar_points`、`/imu`，同时让播放器发布 `/clock`。

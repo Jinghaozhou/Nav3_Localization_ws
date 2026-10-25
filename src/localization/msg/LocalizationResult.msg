@@ -5,6 +5,10 @@ builtin_interfaces/Time last_success_stamp
 bool matched
 bool applied
 bool has_previous
+string requested_mode
+string actual_mode
+bool fallback_used
+string fallback_reason
 # True when the old and candidate map->base_link poses could be compared.
 bool delta_valid
 string reason
@@ -14,6 +18,7 @@ geometry_msgs/TransformStamped candidate_map_to_odom
 # These values are meaningful only when delta_valid is true.
 float64 translation_delta_m
 float64 rotation_delta_deg
+# KISS coarse inliers; zero when actual_mode is local.
 uint32 inliers
 float64 overlap_percent
 float64 registration_ms

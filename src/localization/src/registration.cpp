@@ -1,6 +1,7 @@
 #include "localization/registration.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include <pcl/common/transforms.h>
@@ -65,21 +66,39 @@ LocalizationResult LocalizationRegistration::refine(
   result.overlap_percent =
       static_cast<double>(fine_result.num_inliers) / source_ptr->size() * 100.0;
   result.target_T_source = fine_matcher_->getFinalTransformation().cast<double>();
-  if (result.overlap_percent > config_.overlap_threshold) {
+  result.converged = fine_result.converged;
+  if (result.converged && result.target_T_source.allFinite() &&
+      result.overlap_percent > config_.overlap_threshold) {
     result.valid = true;
-    result.converged = true;
   }
   if (config_.verbose) {
     if (result.valid) {
-      RCLCPP_INFO(logger_, "VGICP accepted: overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
+      RCLCPP_INFO(logger_, "VGICP accepted: converged=true, overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
                   result.overlap_percent, fine_result.num_inliers, source_ptr->size(),
                   config_.overlap_threshold);
     } else {
-      RCLCPP_WARN(logger_, "VGICP rejected: overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
+      RCLCPP_WARN(logger_, "VGICP rejected: converged=%s, finite=%s, overlap=%.2f%% (%zu/%zu points; required > %.2f%%)",
+                  result.converged ? "true" : "false",
+                  result.target_T_source.allFinite() ? "true" : "false",
                   result.overlap_percent, fine_result.num_inliers, source_ptr->size(),
                   config_.overlap_threshold);
     }
   }
+  return result;
+}
+
+LocalizationResult LocalizationRegistration::alignLocal(
+    const pcl::PointCloud<LocalizationPoint> &source,
+    const pcl::PointCloud<LocalizationPoint> &target,
+    const Eigen::Matrix4d &initial_guess) {
+  if (!initial_guess.allFinite()) {
+    throw std::invalid_argument("non-finite local registration initial guess");
+  }
+  coarse_aligned_->clear();
+  fine_aligned_->clear();
+  pcl::transformPointCloud(source, *coarse_aligned_, initial_guess);
+  auto result = refine(*coarse_aligned_, target);
+  result.target_T_source = result.target_T_source * initial_guess;
   return result;
 }
 

@@ -37,35 +37,57 @@ ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
 
 全局地图启动时读取并体素化一次；局部地图订阅使用 sensor-data QoS，
 持续接收并只保留最新的 `PointCloud2`。启动时获得有效局部地图后
-自动定位；成功后按 `periodic_interval_sec` 周期再次定位。
+自动运行无先验的全局定位（KISS 粗配准 + VGICP 精配准）；成功应用后按
+`periodic_interval_sec` 周期运行带 TF 初值的局部定位（仅 VGICP）。
+局部配准未收敛、重叠率不足、修正过大或无法取得 TF 初值时，会在同一次
+尝试中用同一帧点云回退到全局定位。回退结果仍须通过质量与自动应用检查。
 将该参数设为 `0.0` 可关闭周期定位，保留启动定位和服务调用。
-失败后按 `retry_interval_sec` 重试启动定位。
+首次定位失败，或已定位后一次自动配准失败时，按 `retry_interval_sec`
+重试。配准成功但因位姿跳变成为待确认候选时，不用短间隔重试覆盖候选。
+
+局部输入点云本身在 `odom` 下，所以 VGICP 所需初值就是 TF 中现成的
+`map ← odom`，无需经过雷达坐标系换算。节点查询最新的 `map ← odom`，
+并检查其时效不超过 `max_prior_tf_age_sec`。首次定位仍强制使用全局模式；
+局部服务在没有
+已应用位姿时返回 `no_local_prior`。后续 TF 中的
+`map → odom` 来自本节点上次应用的结果，因此局部初值是里程计预测，
+不是独立的全局观测；出现大幅漂移时依靠全局回退重新定位。
 
 ## 服务和状态
 
 ```bash
 ros2 service call /localization/relocalize \
   kiss_matcher_localization/srv/Relocalize \
-  "{apply_if_safe: true}"
+  "{mode: 1, apply_if_safe: true}"
+
+# 已有定位后，仅用 TF 初值运行 VGICP；不自动回退全局
+ros2 service call /localization/relocalize \
+  kiss_matcher_localization/srv/Relocalize \
+  "{mode: 2, apply_if_safe: true}"
 
 ros2 topic echo /localization/status
 ```
 
-`/localization/relocalize` 使用最新局部地图快照立即运行一次配准，
-响应为 `LocalizationResult`：
+`/localization/relocalize` 使用最新局部地图快照立即运行一次配准。
+`mode=1` 强制全局，`mode=2` 强制局部且失败不回退；`mode=0` 按自动规则
+选择局部或全局，原先只传 `apply_if_safe` 的调用也会得到默认值 `0`。
+无效模式返回 `invalid_mode`。`apply_if_safe=false` 始终只返回候选，
+不更新 TF。响应为 `LocalizationResult`：
 
 | 字段 | 含义 |
 | --- | --- |
-| `matched` | KISS 内点和 VGICP 重叠率均满足阈值 |
+| `matched` | 本次选定的配准模式通过质量检查 |
 | `applied` | 候选 `map -> odom` 已应用 |
+| `requested_mode`、`actual_mode` | 请求模式和最终执行的配准模式（`global` / `local`）；尚未运行配准时后者为空 |
+| `fallback_used`、`fallback_reason` | 自动模式是否从局部回退全局及回退原因 |
 | `reason` | 应用、预览、超出跳变阈值、输入问题或配准失败原因 |
 | `candidate_map_to_odom` | 本次候选变换；仅 `matched=true` 时有效 |
 | `has_previous` | 本次尝试前是否已有已应用的定位 |
 | `delta_valid` | 是否成功利用 `odom -> base_link` 比较新旧机器人全局位姿 |
 | `translation_delta_m` | 同一机器人里程计位姿下，新旧 `map -> base_link` 的平移差（m）；仅 `delta_valid=true` 时有效 |
 | `rotation_delta_deg` | 同一机器人里程计位姿下，新旧 `map -> base_link` 的三维旋转差（°）；仅 `delta_valid=true` 时有效 |
-| `inliers`、`overlap_percent` | 粗配准内点数（点对）和 VGICP 重叠率（%） |
-| `registration_ms` | KISS + VGICP 耗时（ms），不含 ROS/PCL 转换和体素化 |
+| `inliers`、`overlap_percent` | KISS 粗配准内点数和 VGICP 重叠率（%）；局部模式的 `inliers=0` |
+| `registration_ms` | 本次配准耗时（ms）；自动回退时包含局部和全局两次尝试，不含 ROS/PCL 转换与体素化 |
 | `local_map_stamp` | 本次局部地图的采集时间 |
 | `last_success_stamp` | 最近一次应用定位结果的时间；此前从未成功时为零 |
 | `candidate_id` | 成功但未应用时的候选编号 |
@@ -73,7 +95,8 @@ ros2 topic echo /localization/status
 首次定位若 `apply_if_safe=true`，通过质量检查即可应用。
 已有定位时，只有 `delta_valid=true`，且机器人位姿差同时不超过
 `max_auto_translation_m` 与 `max_auto_rotation_deg` 才自动应用。
-`apply_if_safe=false` 始终只返回候选结果。
+通过质量检查还要求 VGICP 实际收敛，变换有效；局部模式还要求修正量不超过
+`local_max_correction_translation_m` 和 `local_max_correction_rotation_deg`。
 
 成功但未应用的结果可在 `candidate_timeout_sec` 内确认：
 
@@ -96,6 +119,9 @@ reliable + transient-local QoS。
 和 `last_success_stamp` 告诉导航系统结果的新鲜程度。发布 TF 时
 使用当前 ROS 时间；状态保留局部地图的原始时间戳。导航系统应
 依据状态自行决定多久以前的全局定位仍可用。
+使用局部模式时，雷达外参 TF 必须与建图配置一致。若 `/Laser_map` 随运行
+不断累积到全局地图之外，重叠率可能下降，即使初值正确也会被拒绝；
+需要结合实际场景调整输入范围或重叠率判定。
 
 默认参数见 [`config/navigation_localization.yaml`](config/navigation_localization.yaml)。
 `1.0 m` 与 `15.0°` 是初始自动应用阈值，需结合实测漂移与导航

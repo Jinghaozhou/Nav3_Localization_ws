@@ -166,10 +166,14 @@ class NavigationLocalizer : public rclcpp::Node {
       initializer_->load(seed_file, map_frame_, base_frame_);
       RCLCPP_WARN(get_logger(), "REGION_INIT enabled profile=%s confirmations=%d; exact snapshot TF required", seed_file.c_str(), init.confirm_windows);
     }
+    candidate_source_=declare_parameter<std::string>("candidate_source","keyframes");
+    if(candidate_source_!="keyframes" && candidate_source_!="bbs") throw std::invalid_argument("Unsupported candidate source");
     keyframes_enabled_=declare_parameter<bool>("keyframe_initialization_enabled",false);
+    if(candidate_source_=="bbs" && !keyframes_enabled_) throw std::invalid_argument("BBS requires candidate packet validation");
     hierarchy_enabled_=declare_parameter<bool>("hierarchical_initialization_enabled",false);
     hierarchy_confidence_=declare_parameter<double>("hierarchical_min_initial_overlap",80.0);
     if(!std::isfinite(hierarchy_confidence_) || hierarchy_confidence_<60 || hierarchy_confidence_>100)throw std::invalid_argument("invalid hierarchical confidence overlap");
+    if(candidate_source_=="bbs" && hierarchy_enabled_) throw std::invalid_argument("BBS competitors must all be refined; hierarchical screening is not allowed");
     if(hierarchy_enabled_ && !keyframes_enabled_) throw std::invalid_argument("Hierarchical trial requires keyframe candidate packet validation");
     keyframe_region_id_=declare_parameter<int>("keyframe_region_id",2);
     keyframe_expected_=declare_parameter<int>("keyframe_expected_candidates",28);
@@ -179,7 +183,10 @@ class NavigationLocalizer : public rclcpp::Node {
       if(!multistart_enabled_ || keyframe_expected_<1 || keyframe_expected_>64 || keyframe_library_sha_.size()!=64 || keyframe_profile_sha_.size()!=64)
         throw std::invalid_argument("Keyframes require multistart and verified library/profile hashes");
       keyframe_map_sha_=fileSha256(map_pcd);
-      RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
+      if(candidate_source_=="bbs")
+        RCLCPP_WARN(get_logger(),"BBS_INIT experimental, dynamic competing map-search peaks; no fixed entrance or keyframe position lookup; all retained peaks require VGICP/ambiguity/two windows");
+      else
+        RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
     }
     loadMap(map_pcd);
     if (!initial_region.empty()) setRegionHint(initial_region);
@@ -387,7 +394,7 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   kiss_matcher::LocalizationResult alignInitialized(const pcl::PointCloud<Point> &source) {
-    attempt_mode_ = keyframe_attempt_ ? "keyframe_multistart" : "region_multistart";
+    attempt_mode_ = keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_multistart" : "keyframe_multistart") : "region_multistart";
     attempt_region_id_=active_region_id_;
     const auto started=Clock::now();
     const pcl::PointCloud<Point> *target=map_cloud_.get();
@@ -408,14 +415,14 @@ class NavigationLocalizer : public rclcpp::Node {
     } else {
       for(const auto &[id,guess]:guesses) {
         auto registration=registration_->alignWithPrior(source,*target,guess,initializer_->config().crop_margin);
-        candidates.push_back(initializer_->evaluate(id,keyframe_attempt_ ? "keyframe_vgicp" : "seed_vgicp",registration,initialization_odom_,guess,!keyframe_attempt_));
+        candidates.push_back(initializer_->evaluate(id,keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_vgicp" : "keyframe_vgicp") : "seed_vgicp",registration,initialization_odom_,guess,!keyframe_attempt_));
       }
       seed_candidates_=candidates.size();
     }
     initialization_decision_=initializer_->decide(candidates,initialization_stamp_,initialization_odom_);
     if(hierarchy_blocked){initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=hierarchy_reason;}
-    if(keyframe_attempt_ && hierarchy_enabled_ && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
-      initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason="hierarchy_low_confidence";
+    if(keyframe_attempt_ && (hierarchy_enabled_ || candidate_source_=="bbs") && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
+      initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=candidate_source_=="bbs" ? "bbs_low_confidence" : "hierarchy_low_confidence";
     }
     initialization_selected_seed_.clear();
     kiss_matcher::LocalizationResult selected;
@@ -614,7 +621,7 @@ class NavigationLocalizer : public rclcpp::Node {
       if(m->map_sha256!=keyframe_map_sha_ || m->library_sha256!=keyframe_library_sha_ || m->profile_sha256!=keyframe_profile_sha_ || m->region_id!=keyframe_region_id_) {
         result.reason="keyframe_version_or_region_mismatch";initializer_->resetConfirmation();return result;
       }
-      if(m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
+      if((candidate_source_=="bbs" ? (m->map_to_odom.empty() || m->map_to_odom.size()>static_cast<std::size_t>(keyframe_expected_) || m->reason!="bbs_competitors_complete") : m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_)) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9<0.8 ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9>1.05 || m->ids.size()!=m->map_to_odom.size() || m->scores.size()!=m->ids.size()) {
         result.reason="keyframe_candidate_shape_invalid";initializer_->resetConfirmation();return result;
@@ -927,6 +934,7 @@ class NavigationLocalizer : public rclcpp::Node {
   pcl::PointCloud<Point>::Ptr map_cloud_;
   kiss_matcher::RegionMap region_map_;
   std::string region_labels_csv_;
+  std::string candidate_source_;
   bool keyframes_enabled_=false,keyframe_attempt_=false;
   std::string keyframe_map_sha_,keyframe_library_sha_,keyframe_profile_sha_;
   int keyframe_region_id_=2,keyframe_expected_=28;

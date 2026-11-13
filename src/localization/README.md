@@ -1,3 +1,11 @@
+> 2026-11-02：新增默认关闭的区域多初值VGICP初始化，使用map_T_base候选＋快照时刻TF、歧义检查及两窗确认。完整实验、候选地图及启动命令见[实验手册](/home/pc/人形/项目文档/01_操作手册/地图与区域初始化.md)。默认3_part未替换，新图需显式指定；实机收益待验证。
+
+> **2026-11-04 当前地图更新**：默认参考图已切换为 `kiss_localization_ws1.1/src/localization/maps/building_split_space.pcd`，由楚昕 `building_split(space).bin` 转换，区域统一为 `space_1`～`space_13`（region_id=1～13）。保持新图原生坐标；旧入口楼梯对应新图 **space_2**。一键启动默认 space_2，使用 `mid360_lidar/config/region_initialization_space.yaml` 的15个迁移候选；其他区域尚无候选库，使用区域KISS及全图回退。旧3_part和旧候选图保留用于历史复现，不再默认调用。详见 [space分区地图操作手册](/home/pc/人形/项目文档/01_操作手册/地图与区域初始化.md)；新地图接入已完成离线和隔离节点测试，尚待新一轮实扫验证。
+
+> 2026-10-30：新增PCD `region_id` + CSV名称表的区域辅助初始化。启动 `initial_region:=5号楼入口楼梯` 或调用 `/localization/set_region`；成功后消耗提示并正常先验跟踪，失败可回退全图。详见[操作与验证说明](/home/pc/人形/项目文档/01_操作手册/地图与区域初始化.md)。新地图已替换到src/localization/maps/3_part.pcd，旧图有备份。中文目录迁移后的rosidl生成采用真实英文build缓存，增量编译见该手册。
+
+> 本机集成版（2026-10-24）保留先验VGICP/全局回退；项目组合入口及有效参数见 `/home/pc/人形/项目文档/01_操作手册/扫描与连续定位.md`。`min_inliers` 表格指yaml显式配置，裸节点C++默认仍为20；`use_prior_tracking` 由项目配置开启。
+
 # KISS Matcher 点云定位 ROS 2 包
 
 `kiss_matcher_localization` 将 `odom` 坐标系中的局部点云与 `map` 坐标系中的
@@ -34,7 +42,7 @@ bash src/localization/deployment/build_from_source.sh
 ```
 
 脚本依次构建算法库和本包、`pcd_cloud_publisher`、
-`localization_visualizer` 三个 ROS 包。算法库安装在 `external/`，
+`localization_visualizer`、`localization_path_recorder` 四个 ROS 包。算法库安装在 `external/`，
 ROS 包安装在 `install/`。详细构建依赖和检查方法见
 [从源码构建说明](deployment/README.md)。
 
@@ -62,6 +70,8 @@ ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
 PCD 离线调试的三包启动命令见[工作空间 README](../../README.md#3-使用-pcd-调试输入)。
 实时定位时，可视化包还能在一个 RViz 窗口并排显示全局图和
 尚未对齐的局部图；启动命令见[可视化包说明](../localization_visualizer/README.md)。
+定位成功后，可启动[轨迹记录包](../localization_path_recorder/README.md)，
+从 `map ← base_link` TF 发布 `/localization/map_path` 并叠加到可视化窗口的全局图上。
 
 启动日志会显示全局地图加载前后的点数；首次收到局部地图时记录话题、
 frame 和点数。每次配准会记录局部地图解码与降采样后的点数、两张地图
@@ -93,12 +103,12 @@ frame 和点数。每次配准会记录局部地图解码与降采样后的点�
 | `voxel_resolution` | `0.1` m | 全局图和局部图的体素大小；必须大于 0 |
 | `max_local_map_age_sec` | `10.0` s | 局部图时间戳允许的最大年龄；设为 `0.0` 关闭此项检查 |
 | `retry_interval_sec` | `5.0` s | 首次定位成功前的自动重试间隔；必须大于 0 |
-| `periodic_interval_sec` | `60.0` s | 已定位后的自动重定位间隔；设为 `0.0` 关闭周期重定位 |
+| `periodic_interval_sec` | `5.0` s | 已定位后的自动重定位间隔；设为 `0.0` 关闭周期重定位 |
 | `max_auto_translation_m` | `1.0` m | 已定位时自动应用新结果允许的最大平移差 |
 | `max_auto_rotation_deg` | `15.0`° | 已定位时自动应用新结果允许的最大旋转差 |
 | `candidate_timeout_sec` | `60.0` s | 未自动应用的候选结果可确认的时长；必须大于 0 |
 | `verbose` | `true` | 输出配准过程日志 |
-| `min_inliers` | `20` | KISS Matcher 粗配准的最少内点数；必须大于 0 |
+| `min_inliers` | `10` | KISS Matcher 粗配准的最少内点数；必须大于 0 |
 | `vgicp_threads` | `4` | VGICP 使用的线程数；必须大于 0 |
 | `vgicp_neighbors` | `20` | VGICP 邻域点数；必须大于 0 |
 | `vgicp_max_correspondence_scale` | `3.0` | VGICP 最大对应距离与 `voxel_resolution` 的倍率；必须大于 0 |

@@ -2,6 +2,8 @@
 launch:
   - arg: {name: map_pcd, default: "", description: "Optional global map PCD in map frame"}
   - arg: {name: local_map_topic, default: "/local_map"}
+  - arg: {name: path_topic, default: "/localization/map_path"}
+  - arg: {name: pose_topic, default: "/localization/map_pose"}
   - arg: {name: local_map_reliability, default: "best_effort", description: "best_effort or reliable"}
   - arg: {name: map_frame, default: "map"}
   - arg: {name: odom_frame, default: "odom"}
@@ -16,10 +18,12 @@ launch:
       exec: localization_visualizer_node
       namespace: localization_visualization
       name: localization_visualizer
-      output: screen
+      output: own_log
       param:
         - {name: map_pcd, value: $(var map_pcd)}
         - {name: local_map_topic, value: $(var local_map_topic)}
+        - {name: path_topic, value: $(var path_topic)}
+        - {name: pose_topic, value: $(var pose_topic)}
         - {name: local_map_reliability, value: $(var local_map_reliability)}
         - {name: map_frame, value: $(var map_frame)}
         - {name: odom_frame, value: $(var odom_frame)}
@@ -32,6 +36,6 @@ launch:
       pkg: rviz2
       exec: rviz2
       name: localization_rviz
-      output: screen
+      output: own_log
       args: >
         -d $(var rviz_path)

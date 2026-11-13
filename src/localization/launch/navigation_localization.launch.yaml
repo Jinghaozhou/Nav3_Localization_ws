@@ -1,12 +1,25 @@
 ---
 launch:
-  - arg: {name: map_pcd, default: $(find-pkg-share kiss_matcher_localization)/maps/3_part.pcd, description: "Global map PCD in map frame"}
+  - arg: {name: map_pcd, default: $(find-pkg-share kiss_matcher_localization)/maps/building_split_space.pcd, description: "Global map PCD in map frame"}
+  - arg: {name: region_labels_csv, default: $(find-pkg-share kiss_matcher_localization)/maps/region_labels.csv}
+  - arg: {name: initial_region, default: "", description: "Current region ID/name/sentence; empty means full map"}
+  - arg: {name: hierarchical_min_initial_overlap, default: "80.0"}
+  - arg: {name: hierarchical_initialization_enabled, default: "false"}
+  - arg: {name: keyframe_initialization_enabled, default: "false"}
+  - arg: {name: keyframe_library_sha256, default: ""}
+  - arg: {name: keyframe_profile_sha256, default: ""}
+  - arg: {name: keyframe_region_id, default: "2"}
+  - arg: {name: keyframe_expected_candidates, default: "28"}
+  - arg: {name: region_multistart_enabled, default: "false"}
+  - arg: {name: region_seed_file, default: "", description: "Version 1 map_T_base seed YAML"}
   - arg: {name: local_map_topic, default: "/local_map"}
   - arg: {name: local_map_reliability, default: "best_effort", description: "best_effort or reliable"}
   - arg: {name: map_frame, default: "map"}
   - arg: {name: odom_frame, default: "odom"}
   - arg: {name: base_frame, default: "base_link"}
   - arg: {name: config_path, default: $(find-pkg-share kiss_matcher_localization)/config/navigation_localization.yaml}
+  - arg: {name: metrics_csv, default: "", description: "Optional per-attempt diagnostics CSV"}
+  - arg: {name: record_inputs, default: "false", description: "Publish exact input snapshots for rosbag"}
   - node:
       pkg: kiss_matcher_localization
       exec: navigation_localizer
@@ -16,7 +29,20 @@ launch:
       on_exit: shutdown
       param:
         - from: $(var config_path)
+        - {name: metrics_csv, value: $(var metrics_csv)}
+        - {name: publish_attempt_inputs, value: $(var record_inputs)}
         - {name: map_pcd, value: $(var map_pcd)}
+        - {name: region_labels_csv, value: $(var region_labels_csv)}
+        - {name: initial_region, value: $(var initial_region), type: str}
+        - {name: region_multistart_enabled, value: $(var region_multistart_enabled), type: bool}
+        - {name: hierarchical_min_initial_overlap, value: $(var hierarchical_min_initial_overlap), type: float}
+        - {name: hierarchical_initialization_enabled, value: $(var hierarchical_initialization_enabled), type: bool}
+        - {name: keyframe_initialization_enabled, value: $(var keyframe_initialization_enabled), type: bool}
+        - {name: keyframe_library_sha256, value: $(var keyframe_library_sha256), type: str}
+        - {name: keyframe_profile_sha256, value: $(var keyframe_profile_sha256), type: str}
+        - {name: keyframe_region_id, value: $(var keyframe_region_id), type: int}
+        - {name: keyframe_expected_candidates, value: $(var keyframe_expected_candidates), type: int}
+        - {name: region_seed_file, value: $(var region_seed_file), type: str}
         - {name: local_map_topic, value: $(var local_map_topic)}
         - {name: local_map_reliability, value: $(var local_map_reliability)}
         - {name: map_frame, value: $(var map_frame)}

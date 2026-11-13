@@ -1,14 +1,23 @@
+#include "localization/hierarchical_search.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <Eigen/Geometry>
+#include <openssl/evp.h>
+#include "kiss_matcher_localization/msg/keyframe_candidates.hpp"
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
@@ -22,16 +31,31 @@
 #include <tf2_ros/transform_listener.h>
 
 #include "kiss_matcher_localization/msg/localization_result.hpp"
+#include "kiss_matcher_localization/msg/localization_input.hpp"
 #include "kiss_matcher_localization/srv/accept_candidate.hpp"
 #include "kiss_matcher_localization/srv/relocalize.hpp"
 #include "localization/registration.h"
+#include "localization/region_map.h"
+#include "localization/region_initializer.h"
+#include "kiss_matcher_localization/srv/set_region.hpp"
 
 namespace {
+using Keyframes = kiss_matcher_localization::msg::KeyframeCandidates;
 using Clock = std::chrono::steady_clock;
 using Point = kiss_matcher::LocalizationPoint;
 using Result = kiss_matcher_localization::msg::LocalizationResult;
 using Relocalize = kiss_matcher_localization::srv::Relocalize;
 using AcceptCandidate = kiss_matcher_localization::srv::AcceptCandidate;
+using SetRegion = kiss_matcher_localization::srv::SetRegion;
+
+std::string fileSha256(const std::string &path) {
+  std::ifstream in(path,std::ios::binary);if(!in) throw std::runtime_error("Cannot hash map");
+  auto *ctx=EVP_MD_CTX_new();if(!ctx) throw std::runtime_error("Digest allocation");
+  EVP_DigestInit_ex(ctx,EVP_sha256(),nullptr);char data[65536];
+  while(in){in.read(data,sizeof(data));EVP_DigestUpdate(ctx,data,in.gcount());}
+  unsigned char out[EVP_MAX_MD_SIZE];unsigned int count=0;EVP_DigestFinal_ex(ctx,out,&count);EVP_MD_CTX_free(ctx);
+  std::ostringstream result;for(unsigned int i=0;i<count;++i)result<<std::hex<<std::setw(2)<<std::setfill('0')<<int(out[i]);return result.str();
+}
 
 geometry_msgs::msg::TransformStamped toTransform(const Eigen::Matrix4d &pose,
                                                   const std::string &parent,
@@ -71,8 +95,8 @@ class NavigationLocalizer : public rclcpp::Node {
         declare_parameter<std::string>("local_map_reliability", "best_effort");
     voxel_resolution_ = declare_parameter<double>("voxel_resolution", 0.1);
     max_local_map_age_sec_ = declare_parameter<double>("max_local_map_age_sec", 10.0);
-    retry_interval_sec_ = declare_parameter<double>("retry_interval_sec", 5.0);
-    periodic_interval_sec_ = declare_parameter<double>("periodic_interval_sec", 60.0);
+    retry_interval_sec_ = declare_parameter<double>("retry_interval_sec", 1.0);
+    periodic_interval_sec_ = declare_parameter<double>("periodic_interval_sec", 1.0);
     max_auto_translation_m_ = declare_parameter<double>("max_auto_translation_m", 1.0);
     max_auto_rotation_deg_ = declare_parameter<double>("max_auto_rotation_deg", 15.0);
     candidate_timeout_sec_ = declare_parameter<double>("candidate_timeout_sec", 60.0);
@@ -91,23 +115,122 @@ class NavigationLocalizer : public rclcpp::Node {
     kiss_matcher::LocalizationConfig config;
     config.voxel_resolution = voxel_resolution_;
     config.verbose = declare_parameter<bool>("verbose", true);
-    const int min_inliers = declare_parameter<int>("min_inliers", 20);
-    config.min_inliers = static_cast<std::size_t>(std::max(min_inliers, 0));
+    config.enable_coarse = false;  // Continuous localization never constructs or calls KISS.
     config.num_threads = declare_parameter<int>("vgicp_threads", 4);
     config.correspondence_randomness = declare_parameter<int>("vgicp_neighbors", 20);
     config.scale_factor_for_corr_dist =
         declare_parameter<double>("vgicp_max_correspondence_scale", 3.0);
     config.overlap_threshold = declare_parameter<double>("min_overlap_percent", 70.0);
-    if (min_inliers <= 0 || config.num_threads <= 0 ||
+    if (config.num_threads <= 0 ||
         config.correspondence_randomness <= 0 ||
         config.scale_factor_for_corr_dist <= 0.0 ||
         config.overlap_threshold < 0.0 || config.overlap_threshold > 100.0) {
       throw std::invalid_argument("invalid registration parameters");
     }
 
+    use_prior_ = declare_parameter<bool>("use_prior_tracking", false);
+    capture_inputs_ = declare_parameter<bool>("publish_attempt_inputs", false);
+    selected_input_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("selected_cloud",rclcpp::QoS(2).reliable());
+    input_capture_pub_ = create_publisher<kiss_matcher_localization::msg::LocalizationInput>(
+        "input_snapshot", rclcpp::QoS(10).reliable());
+    prior_margin_ = declare_parameter<double>("prior_crop_margin_m", 5.0);
+    prior_max_age_ = declare_parameter<double>("prior_max_age_sec", 30.0);
+    global_topic_ = declare_parameter<std::string>("global_local_map_topic", "");
+    if (prior_margin_ <= 0 || prior_max_age_ <= 0)
+      throw std::invalid_argument("invalid prior tracking parameters");
+    region_labels_csv_ = declare_parameter<std::string>("region_labels_csv", "");
+    const auto initial_region = declare_parameter<std::string>("initial_region", "");
+    multistart_enabled_ = declare_parameter<bool>("region_multistart_enabled", false);
+    const auto seed_file = declare_parameter<std::string>("region_seed_file", "");
+    kiss_matcher::InitializerConfig init;
+    init.max_candidates = declare_parameter<int>("region_max_candidates", 64);
+    init.confirm_windows = declare_parameter<int>("initialization_confirm_windows", 2);
+    init.crop_margin = declare_parameter<double>("region_seed_crop_margin_m", 5.0);
+    init.max_translation_correction = declare_parameter<double>("seed_max_translation_correction_m", 1.0);
+    init.max_rotation_correction_deg = declare_parameter<double>("seed_max_rotation_correction_deg", 30.0);
+    init.cluster_translation = declare_parameter<double>("candidate_cluster_translation_m", 0.5);
+    init.cluster_rotation_deg = declare_parameter<double>("candidate_cluster_rotation_deg", 10.0);
+    init.ambiguity_gap_percent = declare_parameter<double>("ambiguity_overlap_gap_percent", 5.0);
+    init.confirm_min_dt = declare_parameter<double>("initialization_confirm_min_dt_sec", 1.0);
+    init.confirm_timeout = declare_parameter<double>("initialization_confirm_timeout_sec", 30.0);
+    init.consistency_translation = declare_parameter<double>("initialization_consistency_translation_m", 0.5);
+    init.consistency_rotation_deg = declare_parameter<double>("initialization_consistency_rotation_deg", 5.0);
+    init.max_inlier_rmse = declare_parameter<double>("initialization_max_inlier_rmse_m", 0.2);
+    init.min_fine_inliers = declare_parameter<int>("initialization_min_fine_inliers", 20);
+    initialization_tf_timeout_ = declare_parameter<double>("initialization_tf_timeout_sec", 0.2);
+    if (!std::isfinite(initialization_tf_timeout_) || initialization_tf_timeout_ <= 0)
+      throw std::invalid_argument("invalid initialization TF timeout");
+    initializer_ = std::make_unique<kiss_matcher::RegionInitializer>(init);
+    if (multistart_enabled_) {
+      if (seed_file.empty()) throw std::invalid_argument("region_seed_file required when multistart enabled");
+      initializer_->load(seed_file, map_frame_, base_frame_);
+      RCLCPP_WARN(get_logger(), "REGION_INIT enabled profile=%s confirmations=%d; exact snapshot TF required", seed_file.c_str(), init.confirm_windows);
+    }
+    keyframes_enabled_=declare_parameter<bool>("keyframe_initialization_enabled",false);
+    hierarchy_enabled_=declare_parameter<bool>("hierarchical_initialization_enabled",false);
+    hierarchy_confidence_=declare_parameter<double>("hierarchical_min_initial_overlap",80.0);
+    if(!std::isfinite(hierarchy_confidence_) || hierarchy_confidence_<60 || hierarchy_confidence_>100)throw std::invalid_argument("invalid hierarchical confidence overlap");
+    if(hierarchy_enabled_ && !keyframes_enabled_) throw std::invalid_argument("Hierarchical trial requires keyframe candidate packet validation");
+    keyframe_region_id_=declare_parameter<int>("keyframe_region_id",2);
+    keyframe_expected_=declare_parameter<int>("keyframe_expected_candidates",28);
+    keyframe_library_sha_=declare_parameter<std::string>("keyframe_library_sha256","");
+    keyframe_profile_sha_=declare_parameter<std::string>("keyframe_profile_sha256","");
+    if(keyframes_enabled_) {
+      if(!multistart_enabled_ || keyframe_expected_<1 || keyframe_expected_>64 || keyframe_library_sha_.size()!=64 || keyframe_profile_sha_.size()!=64)
+        throw std::invalid_argument("Keyframes require multistart and verified library/profile hashes");
+      keyframe_map_sha_=fileSha256(map_pcd);
+      RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
+    }
     loadMap(map_pcd);
+    if (!initial_region.empty()) setRegionHint(initial_region);
     registration_ = std::make_unique<kiss_matcher::LocalizationRegistration>(
         config, get_logger());
+    if(hierarchy_enabled_) {
+      auto coarse_config=config;coarse_config.voxel_resolution=.25;coarse_config.max_num_iter=16;coarse_config.verbose=false;
+      screening_=std::make_unique<kiss_matcher::LocalizationRegistration>(coarse_config,get_logger());
+    }
+    const auto metrics_csv = declare_parameter<std::string>("metrics_csv", "");
+    if (!metrics_csv.empty()) {
+      const std::filesystem::path path(metrics_csv);
+      if (std::filesystem::exists(path))
+        throw std::invalid_argument("metrics_csv already exists; use a new experiment directory");
+      if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+      metrics_.open(path);
+      if (!metrics_) throw std::runtime_error("cannot open metrics_csv: " + metrics_csv);
+      metrics_ << "attempt,completed_ns,cloud_ns,mode,input_points,voxel_points,global_points,"
+                  "target_points_used,source_features,target_features,initial_matches,"
+                  "pruned_matches,rotation_inliers,coarse_inliers,coarse_ran,fine_ran,"
+                  "matched,applied,reason,overlap_percent,registration_ms,total_ms,"
+                  "input_age_at_result_sec,matched_total,applied_total,region_id,region_name,"
+                  "region_target_points,region_registration_ms,region_full_fallback,"
+                  "region_coarse_inliers,region_overlap_percent,initialization_state,seed_candidates,"
+                  "candidate_clusters,confirmation_count,initialization_selected_seed\n";
+      metrics_.flush();
+      RCLCPP_INFO(get_logger(), "Matching metrics CSV: %s", metrics_csv.c_str());
+    }
+    auto candidate_csv = declare_parameter<std::string>("region_candidates_csv", "");
+    if (multistart_enabled_) {
+      if (candidate_csv.empty() && !metrics_csv.empty())
+        candidate_csv = (std::filesystem::path(metrics_csv).parent_path() / "region_candidates.csv").string();
+      if (!candidate_csv.empty()) {
+        const std::filesystem::path path(candidate_csv);
+        if (std::filesystem::exists(path)) throw std::invalid_argument("region_candidates_csv already exists");
+        if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+        candidate_metrics_.open(path);
+        if (!candidate_metrics_) throw std::runtime_error("cannot open region candidate CSV");
+        candidate_metrics_ << "attempt,cloud_ns,reference_ns,region_id,seed_id,stage,eligible,reason,cluster,"
+            "converged,fine_inliers,overlap_percent,inlier_rmse_m,selected,initialization_state,confirmation_count";
+        for (const auto *prefix : {"map_T_base", "map_T_odom", "odom_T_base"})
+          for (int i=0;i<4;++i) for(int j=0;j<4;++j) candidate_metrics_ << ',' << prefix << i << j;
+        candidate_metrics_ << ",coarse_ran,fine_ran\n"; candidate_metrics_.flush();
+        RCLCPP_INFO(get_logger(), "Region candidate CSV: %s", candidate_csv.c_str());
+      } else RCLCPP_WARN(get_logger(), "REGION_INIT no candidate CSV configured; set metrics_csv or region_candidates_csv for replay evidence");
+    }
+    RCLCPP_INFO(get_logger(),
+        "Localization config: VGICP-only voxel=%.3fm overlap>%.1f%% retry=%.1fs "
+        "period=%.1fs (completion-to-next-start, 100ms polling) prior=%s; coarse features/inliers are N/A",
+        voxel_resolution_, config.overlap_threshold, retry_interval_sec_,
+        periodic_interval_sec_, use_prior_ ? "true" : "false");
 
     input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     registration_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -119,6 +242,10 @@ class NavigationLocalizer : public rclcpp::Node {
     if (local_map_reliability == "reliable") {
       input_qos.reliable();
     }
+    if(keyframes_enabled_) keyframe_sub_=create_subscription<Keyframes>("/localization/keyframe_candidates",rclcpp::QoS(2).reliable(),
+        [this](Keyframes::ConstSharedPtr m){std::lock_guard<std::mutex> lock(input_mutex_);
+          // Only actual odometry-window epochs may reset an accepted trajectory, not an unvalidated candidate packet.
+          latest_keyframes_=std::move(m);},options);
     local_map_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         local_map_topic, input_qos,
         [this, local_map_topic](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
@@ -127,6 +254,10 @@ class NavigationLocalizer : public rclcpp::Node {
           bool first_message = false;
           {
             std::lock_guard<std::mutex> lock(input_mutex_);
+            if(multistart_enabled_ && latest_local_map_ &&
+                rclcpp::Time(message->header.stamp)<rclcpp::Time(latest_local_map_->header.stamp)) {
+              input_time_reset_=true;latest_global_map_.reset();
+            }
             latest_local_map_ = std::move(message);
             if (!first_local_map_logged_) {
               first_local_map_logged_ = true;
@@ -139,6 +270,15 @@ class NavigationLocalizer : public rclcpp::Node {
                         local_map_topic.c_str(), frame.c_str(), points);
           }
         }, options);
+
+    if (!global_topic_.empty()) {
+      global_map_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        global_topic_, input_qos,
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+          std::lock_guard<std::mutex> lock(input_mutex_);
+          latest_global_map_ = std::move(message);
+        }, options);
+    }
 
     rclcpp::QoS status_qos(1);
     status_qos.reliable().transient_local();
@@ -153,7 +293,6 @@ class NavigationLocalizer : public rclcpp::Node {
         "relocalize",
         [this](const std::shared_ptr<Relocalize::Request> request,
                std::shared_ptr<Relocalize::Response> response) {
-          last_attempt_ = Clock::now();
           response->result = runLocalization(request->apply_if_safe);
           response->result.completed_stamp = get_clock()->now();
           status_pub_->publish(response->result);
@@ -170,8 +309,24 @@ class NavigationLocalizer : public rclcpp::Node {
         },
         service_qos, registration_group_);
 
+    region_service_ = create_service<SetRegion>(
+        "set_region",
+        [this](const std::shared_ptr<SetRegion::Request> request,
+               std::shared_ptr<SetRegion::Response> response) {
+          try {
+            setRegionHint(request->region);
+            response->success = true;
+            response->region_id = active_region_id_;
+            response->region_name = active_region_id_ < 0 ? "全图" : region_map_.region(active_region_id_).name;
+            response->target_points = active_region_id_ < 0 ? map_cloud_->size() : region_map_.region(active_region_id_).cloud->size();
+            response->message = "Hint armed for next attempt; current TF retained; hint consumed on next applied result";
+          } catch (const std::exception &error) {
+            response->success = false; response->region_id = -1; response->message = error.what();
+          }
+        }, service_qos, registration_group_);
+
     trigger_timer_ = create_wall_timer(
-        std::chrono::seconds(1), [this]() { triggerAutomatically(); }, registration_group_);
+        std::chrono::milliseconds(100), [this]() { triggerAutomatically(); }, registration_group_);
     tf_timer_ = create_wall_timer(
         std::chrono::milliseconds(100), [this]() { publishTf(); }, tf_group_);
   }
@@ -182,34 +337,118 @@ class NavigationLocalizer : public rclcpp::Node {
     Eigen::Matrix4d map_T_odom;
     Result result;
     Clock::time_point created;
+    std::optional<Eigen::Matrix4d> snapshot_odom;
   };
 
   void loadMap(const std::string &path) {
-    pcl::PointCloud<pcl::PointXYZ> xyz;
-    if (pcl::io::loadPCDFile(path, xyz) < 0 || xyz.empty()) {
-      throw std::runtime_error("failed to load nonempty global map PCD: " + path);
+    region_map_.load(path, region_labels_csv_, voxel_resolution_);
+    map_cloud_ = region_map_.full();
+    RCLCPP_INFO(get_logger(), "Global map loaded: path=%s frame=%s points=%zu -> %zu voxel=%.3fm region_id=%s skipped=%zu",
+        path.c_str(), map_frame_.c_str(), region_map_.rawPoints(), map_cloud_->size(), voxel_resolution_,
+        region_map_.hasLabels() ? "present" : "absent", region_map_.skippedPoints());
+    for (const auto &[id, entry] : region_map_.regions())
+      RCLCPP_INFO(get_logger(), "MAP_REGION id=%d name=%s points=%zu -> %zu", id, entry.name.c_str(), entry.raw_points, entry.cloud->size());
+  }
+
+  void setRegionHint(const std::string &hint) {
+    const int id = region_map_.resolveHint(hint);  // Validate before changing current state.
+    active_region_id_ = id;
+    if (initializer_) initializer_->reset();
+    recovering_candidates_=false;initialization_reference_ns_=0;
+    force_global_next_ = true;
+    // Keep the completion cooldown when changing region hints.
+    pending_.reset();
+    RCLCPP_INFO(get_logger(), "REGION_HINT id=%d name=%s target=%zu; next attempt uses global/region registration, existing TF retained",
+        id, id < 0 ? "全图" : region_map_.region(id).name.c_str(),
+        id < 0 ? map_cloud_->size() : region_map_.region(id).cloud->size());
+  }
+
+  static std::string csvQuote(const std::string &value) {
+    std::string out = "\"";
+    for (char c : value) { if (c=='"') out += '"'; out += c; }
+    return out + "\"";
+  }
+
+  Eigen::Matrix4d snapshotOdom(const builtin_interfaces::msg::Time &stamp) {
+    // Never use TimePointZero or a saved map->odom as a seed substitute.
+    if (rclcpp::Time(stamp).nanoseconds() <= 0) throw std::runtime_error("zero snapshot timestamp");
+    const auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_,
+        rclcpp::Time(stamp, get_clock()->get_clock_type()), rclcpp::Duration::from_seconds(initialization_tf_timeout_));
+    const auto &q = tf.transform.rotation;
+    Eigen::Quaterniond rotation(q.w,q.x,q.y,q.z);
+    const auto &t = tf.transform.translation;
+    if (!rotation.coeffs().allFinite() || std::abs(rotation.norm()-1)>0.01 ||
+        !std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z))
+      throw std::runtime_error("invalid odom TF");
+    Eigen::Matrix4d pose=Eigen::Matrix4d::Identity();
+    pose.block<3,3>(0,0)=rotation.normalized().toRotationMatrix();
+    pose.block<3,1>(0,3)=Eigen::Vector3d(t.x,t.y,t.z);
+    return pose;
+  }
+
+  kiss_matcher::LocalizationResult alignInitialized(const pcl::PointCloud<Point> &source) {
+    attempt_mode_ = keyframe_attempt_ ? "keyframe_multistart" : "region_multistart";
+    attempt_region_id_=active_region_id_;
+    const auto started=Clock::now();
+    const pcl::PointCloud<Point> *target=map_cloud_.get();
+    if(active_region_id_>=0) {
+      const auto &entry=region_map_.region(active_region_id_);
+      attempt_region_name_=entry.name;region_target_points_=entry.cloud->size();if(!keyframe_attempt_) target=entry.cloud.get();
     }
-    auto full = pcl::PointCloud<Point>::Ptr(new pcl::PointCloud<Point>());
-    full->reserve(xyz.size());
-    for (const auto &point : xyz.points) {
-      Point converted;
-      converted.x = point.x;
-      converted.y = point.y;
-      converted.z = point.z;
-      converted.intensity = 0.0F;
-      full->push_back(converted);
+    initializer_->begin(active_region_id_,initialization_stamp_,initialization_odom_);
+    initialization_reference_ns_=initializer_->referenceStamp();
+    std::vector<kiss_matcher::InitializationCandidate> candidates;
+    bool hierarchy_blocked=false;std::string hierarchy_reason;
+    const auto &guesses=keyframe_attempt_ ? keyframe_guesses_ : initializer_->guesses();
+    if(keyframe_attempt_ && hierarchy_enabled_) {
+      attempt_mode_="keyframe_hierarchical";
+      auto search=kiss_matcher::hierarchicalSearch(source,*target,guesses,initialization_odom_,initialization_stamp_,*initializer_,*screening_,*registration_,hierarchy_confidence_);
+      candidates=std::move(search.candidates);seed_candidates_=search.refined;hierarchy_blocked=search.unresolved_support || search.low_confidence;hierarchy_reason=search.unresolved_support?"hierarchy_unresolved_competitor":"hierarchy_low_confidence";
+      RCLCPP_INFO(get_logger(),"HIERARCHY groups=%zu screened=%zu fine=%zu expanded=%s input_candidates=%zu; screen scores are ranking only",search.groups,search.screened,search.refined,search.expanded?"true":"false",guesses.size());
+    } else {
+      for(const auto &[id,guess]:guesses) {
+        auto registration=registration_->alignWithPrior(source,*target,guess,initializer_->config().crop_margin);
+        candidates.push_back(initializer_->evaluate(id,keyframe_attempt_ ? "keyframe_vgicp" : "seed_vgicp",registration,initialization_odom_,guess,!keyframe_attempt_));
+      }
+      seed_candidates_=candidates.size();
     }
-    xyz.clear();
-    pcl::VoxelGrid<Point> filter;
-    filter.setLeafSize(voxel_resolution_, voxel_resolution_, voxel_resolution_);
-    filter.setInputCloud(full);
-    map_cloud_.reset(new pcl::PointCloud<Point>());
-    filter.filter(*map_cloud_);
-    RCLCPP_INFO(get_logger(),
-                "Global map loaded: path=%s, frame=%s, points=%zu -> %zu "
-                "(voxel=%.3f m)",
-                path.c_str(), map_frame_.c_str(), full->size(), map_cloud_->size(),
-                voxel_resolution_);
+    initialization_decision_=initializer_->decide(candidates,initialization_stamp_,initialization_odom_);
+    if(hierarchy_blocked){initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=hierarchy_reason;}
+    if(keyframe_attempt_ && hierarchy_enabled_ && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
+      initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason="hierarchy_low_confidence";
+    }
+    initialization_selected_seed_.clear();
+    kiss_matcher::LocalizationResult selected;
+    if(initialization_decision_.selected>=0) {
+      const auto &winner=candidates.at(initialization_decision_.selected);
+      selected=winner.registration;initialization_selected_seed_=winner.id;
+    } else if(!candidates.empty()) selected=candidates.back().registration;
+    region_ms_=std::chrono::duration<double,std::milli>(Clock::now()-started).count();
+    for(std::size_t index=0;index<candidates.size();++index) {
+      const auto &c=candidates[index];const auto &r=c.registration;
+      RCLCPP_INFO(get_logger(), "REGION_SEED attempt=%llu seed=%s stage=%s eligible=%s reason=%s cluster=%d overlap=%.3f rmse=%.4f",
+          static_cast<unsigned long long>(attempt_count_),c.id.c_str(),c.stage.c_str(),c.eligible?"true":"false",c.reason.c_str(),c.cluster,r.overlap_percent,r.inlier_rmse);
+      if(candidate_metrics_) {
+        candidate_metrics_ << std::setprecision(17) << attempt_count_ << ',' << initialization_stamp_ << ','
+            << initialization_reference_ns_ << ',' << active_region_id_ << ',' << csvQuote(c.id) << ',' << csvQuote(c.stage)
+            << ',' << c.eligible << ',' << csvQuote(c.reason) << ',' << c.cluster << ',' << r.converged << ',';
+        if(r.fine_ran) candidate_metrics_ << r.fine_inliers;
+        candidate_metrics_ << ',';
+        if(r.fine_ran) candidate_metrics_ << r.overlap_percent;
+        candidate_metrics_ << ',';
+        if(r.fine_ran && std::isfinite(r.inlier_rmse)) candidate_metrics_ << r.inlier_rmse;
+        candidate_metrics_ << ',' << (static_cast<int>(index)==initialization_decision_.selected) << ','
+            << csvQuote(initialization_decision_.reason) << ',' << initialization_decision_.confirmations;
+        for(const Eigen::Matrix4d *pose : std::initializer_list<const Eigen::Matrix4d*>{&c.map_T_base,&r.target_T_source,&initialization_odom_})
+          for(int i=0;i<4;++i) for(int j=0;j<4;++j) candidate_metrics_ << ',' << (*pose)(i,j);
+        candidate_metrics_ << ',' << r.coarse_ran << ',' << r.fine_ran << '\n';
+      }
+    }
+    if(candidate_metrics_.is_open()) {candidate_metrics_.flush();if(!candidate_metrics_) RCLCPP_ERROR(get_logger(),"Cannot flush region candidate CSV");}
+    RCLCPP_INFO(get_logger(),"REGION_INIT attempt=%llu state=%s seeds=%zu clusters=%d confirmations=%d selected=%s stamp=%lld",
+        static_cast<unsigned long long>(attempt_count_),initialization_decision_.reason.c_str(),seed_candidates_,initialization_decision_.clusters,
+        initialization_decision_.confirmations,initialization_selected_seed_.c_str(),static_cast<long long>(initialization_stamp_));
+    return selected;
   }
 
   Result newResult() {
@@ -224,9 +463,126 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   Result runLocalization(bool apply_if_safe) {
+    const auto started = Clock::now();
+    ++attempt_count_;
+    diagnostics_ = {};
+    initialization_decision_ = {};
+    initialization_selected_seed_.clear();
+    seed_candidates_ = 0;
+    initialization_tf_valid_ = false;
+    region_diagnostics_ = {};
+    attempt_region_id_ = -1; attempt_region_name_.clear();
+    region_target_points_ = 0; region_ms_ = 0; region_did_fallback_ = false;
+    attempt_mode_ = "not_run";
+    input_points_ = voxel_points_ = 0;
+    RCLCPP_INFO(get_logger(), "LOC_BEGIN attempt=%llu",
+                static_cast<unsigned long long>(attempt_count_));
+    auto result = runLocalizationImpl(apply_if_safe);
+    const auto completed = get_clock()->now();
+    const double total_ms = std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    matched_count_ += result.matched;
+    applied_count_ += result.applied;
+    if (result.registration_ms > 0.0) durations_.push_back(result.registration_ms);
+    auto sorted = durations_;
+    std::sort(sorted.begin(), sorted.end());
+    const auto percentile = [&](double fraction) {
+      return sorted.empty() ? 0.0 : sorted[static_cast<std::size_t>(std::ceil(fraction * sorted.size())) - 1];
+    };
+    const auto coarse_value = [&](std::size_t value) {
+      return diagnostics_.coarse_ran ? std::to_string(value) : std::string("N/A");
+    };
+    const auto overlap = diagnostics_.fine_ran ? std::to_string(result.overlap_percent) : "N/A";
+    const auto &d = diagnostics_;
+    RCLCPP_INFO(get_logger(),
+        "LOC_METRICS attempt=%llu mode=%s points=%zu->%zu global=%zu target_used=%zu "
+        "features_local=%s features_global=%s matches=%s pruned=%s rot_inliers=%s "
+        "coarse_inliers=%s fine_ran=%s overlap_percent=%s",
+        static_cast<unsigned long long>(attempt_count_), attempt_mode_.c_str(), input_points_,
+        voxel_points_, map_cloud_->size(), d.target_points_used,
+        coarse_value(d.source_features).c_str(), coarse_value(d.target_features).c_str(),
+        coarse_value(d.initial_matches).c_str(), coarse_value(d.pruned_matches).c_str(),
+        coarse_value(d.rotation_inliers).c_str(), coarse_value(result.inliers).c_str(),
+        d.fine_ran ? "true" : "false", overlap.c_str());
+    RCLCPP_INFO(get_logger(),
+        "LOC_RESULT attempt=%llu matched=%s applied=%s reason=%s registration_ms=%.1f "
+        "total_ms=%.1f matched_total=%llu applied_total=%llu applied_rate=%.1f%% "
+        "registration_p50_ms=%.1f registration_p95_ms=%.1f",
+        static_cast<unsigned long long>(attempt_count_), result.matched ? "true" : "false",
+        result.applied ? "true" : "false", result.reason.c_str(), result.registration_ms, total_ms,
+        static_cast<unsigned long long>(matched_count_), static_cast<unsigned long long>(applied_count_),
+        100.0 * applied_count_ / attempt_count_, percentile(.5), percentile(.95));
+    if (metrics_.is_open()) {
+      // CSV uses blank values for stages which did not run, rather than false zeros.
+      const auto csv_coarse = [&](std::size_t value) {
+        return d.coarse_ran ? std::to_string(value) : std::string();
+      };
+      std::string reason;
+      for (char ch : result.reason) { if (ch == '"') reason += '"'; reason += ch; }
+      const auto cloud_ns = rclcpp::Time(result.local_map_stamp).nanoseconds();
+      metrics_ << std::setprecision(15) << attempt_count_ << ',' << completed.nanoseconds() << ','
+               << cloud_ns << ',' << attempt_mode_ << ',' << input_points_ << ',' << voxel_points_
+               << ',' << map_cloud_->size() << ',' << d.target_points_used << ','
+               << csv_coarse(d.source_features) << ',' << csv_coarse(d.target_features) << ','
+               << csv_coarse(d.initial_matches) << ',' << csv_coarse(d.pruned_matches) << ','
+               << csv_coarse(d.rotation_inliers) << ',' << csv_coarse(result.inliers) << ','
+               << d.coarse_ran << ',' << d.fine_ran << ',' << result.matched << ',' << result.applied
+               << ",\"" << reason << "\",";
+      if (d.fine_ran) metrics_ << result.overlap_percent;
+      metrics_ << ',' << result.registration_ms << ',' << total_ms << ',';
+      if (cloud_ns != 0) metrics_ << (completed.nanoseconds() - cloud_ns) / 1e9;
+      metrics_ << ',' << matched_count_ << ',' << applied_count_ << ',';
+      if (attempt_region_id_ >= 0) metrics_ << attempt_region_id_;
+      std::string region_name_csv;
+      for (char ch : attempt_region_name_) { if (ch == '"') region_name_csv += '"'; region_name_csv += ch; }
+      metrics_ << ",\"" << region_name_csv << "\"," << region_target_points_ << ',' << region_ms_ << ',' << region_did_fallback_ << ',';
+      if (region_diagnostics_.coarse_ran) metrics_ << region_diagnostics_.num_final_inliers;
+      metrics_ << ',';
+      if (region_diagnostics_.fine_ran) metrics_ << region_diagnostics_.overlap_percent;
+      metrics_ << ',' << csvQuote(initialization_decision_.reason) << ',' << seed_candidates_ << ','
+          << initialization_decision_.clusters << ',' << initialization_decision_.confirmations << ','
+          << csvQuote(initialization_selected_seed_) << '\n';
+      metrics_.flush();
+      if (!metrics_) RCLCPP_ERROR(get_logger(), "Cannot flush matching metrics CSV; check disk space");
+    }
+    // Every completed attempt, including early rejection and service calls, starts the cooldown.
+    last_completed_ = Clock::now();
+    return result;
+  }
+
+  void captureInput(const sensor_msgs::msg::PointCloud2 &cloud,
+                    const std::string &stage, const std::string &topic) {
+    if(keyframes_enabled_) selected_input_pub_->publish(cloud);
+    if (!capture_inputs_) return;
+    if (input_capture_pub_->get_subscription_count() == 0) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 30000,
+          "Attempt input capture enabled but no recorder subscribes to /localization/input_snapshot");
+      return;
+    }
+    kiss_matcher_localization::msg::LocalizationInput capture;
+    capture.attempt = attempt_count_;
+    capture.stage = stage;
+    capture.source_topic = topic;
+    capture.selected_stamp = get_clock()->now();
+    capture.cloud = cloud;
+    input_capture_pub_->publish(capture);
+  }
+
+  Result runLocalizationImpl(bool apply_if_safe) {
     pending_.reset();
+    if(multistart_enabled_) {
+      bool reset=false;
+      {std::lock_guard<std::mutex> lock(input_mutex_);reset=input_time_reset_;input_time_reset_=false;}
+      if(reset) {
+        initializer_->reset();initialization_reference_ns_=0;
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        has_applied_=false;recovering_candidates_=false;last_apply_wall_.reset();applied_map_T_odom_.setIdentity();
+        force_global_next_=true;
+        RCLCPP_WARN(get_logger(),"REGION_INIT input time reset; discarded applied transform and confirmation history");
+      }
+    }
     Result result = newResult();
     sensor_msgs::msg::PointCloud2::ConstSharedPtr snapshot;
+    std::string snapshot_topic = get_parameter("local_map_topic").as_string();
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       snapshot = latest_local_map_;
@@ -235,7 +591,53 @@ class NavigationLocalizer : public rclcpp::Node {
       result.reason = "no_local_map";
       return result;
     }
+    // Without a valid recent prior, use the larger recovery/initialization window.
+    bool try_prior = false;
+    Eigen::Matrix4d prior = Eigen::Matrix4d::Identity();
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      try_prior = active_region_id_ < 0 && !force_global_next_ && !recovering_candidates_ && use_prior_ && has_applied_ && last_apply_wall_ &&
+        std::chrono::duration<double>(Clock::now() - *last_apply_wall_).count() < prior_max_age_;
+      prior = applied_map_T_odom_;
+    }
+    if (!try_prior && keyframes_enabled_ && has_applied_ && active_region_id_<0 && !recovering_candidates_) {
+      recovering_candidates_=true;initializer_->reset();initialization_reference_ns_=0;
+    }
+    if (!try_prior) {
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      if (latest_global_map_) { snapshot = latest_global_map_; snapshot_topic = global_topic_; }
+    }
+    keyframe_attempt_=false;keyframe_guesses_.clear();
+    if(keyframes_enabled_ && !try_prior && (active_region_id_==keyframe_region_id_ || (active_region_id_<0 && recovering_candidates_))) {
+      Keyframes::ConstSharedPtr m;{std::lock_guard<std::mutex> lock(input_mutex_);m=latest_keyframes_;}
+      if(!m || !m->ready) {result.reason="keyframe_query_unavailable";initializer_->resetConfirmation();return result;}
+      if(m->map_sha256!=keyframe_map_sha_ || m->library_sha256!=keyframe_library_sha_ || m->profile_sha256!=keyframe_profile_sha_ || m->region_id!=keyframe_region_id_) {
+        result.reason="keyframe_version_or_region_mismatch";initializer_->resetConfirmation();return result;
+      }
+      if(m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
+          (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9<0.8 ||
+          (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9>1.05 || m->ids.size()!=m->map_to_odom.size() || m->scores.size()!=m->ids.size()) {
+        result.reason="keyframe_candidate_shape_invalid";initializer_->resetConfirmation();return result;
+      }
+      std::set<std::string> ids(m->ids.begin(),m->ids.end());
+      if(ids.size()!=m->ids.size() || ids.count("")){result.reason="keyframe_candidate_ids_invalid";initializer_->resetConfirmation();return result;}
+      for(std::size_t i=0;i<m->map_to_odom.size();++i) {
+        const auto &v=m->map_to_odom[i];Eigen::Quaterniond q(v.rotation.w,v.rotation.x,v.rotation.y,v.rotation.z);
+        Eigen::Matrix4d T=Eigen::Matrix4d::Identity();
+        if(!q.coeffs().allFinite() || std::abs(q.norm()-1)>0.01 || !std::isfinite(m->scores[i])) {result.reason="keyframe_candidate_nonfinite";initializer_->resetConfirmation();return result;}
+        T.block<3,3>(0,0)=q.normalized().toRotationMatrix();T.block<3,1>(0,3)=Eigen::Vector3d(v.translation.x,v.translation.y,v.translation.z);
+        if(!T.allFinite()){result.reason="keyframe_candidate_nonfinite";initializer_->resetConfirmation();return result;}
+        keyframe_guesses_.emplace_back(m->ids[i],T);
+      }
+      snapshot=std::make_shared<sensor_msgs::msg::PointCloud2>(m->cloud);
+      snapshot_topic="/localization/keyframe_candidates";keyframe_attempt_=true;
+    }
+    if(!try_prior && !keyframe_attempt_ && (!multistart_enabled_ || !initializer_->hasRegion(active_region_id_))) {
+      result.reason=has_applied_ ? "prior_expired_reinitialize_required" : "initialization_candidates_unavailable";
+      return result;
+    }
     result.local_map_stamp = snapshot->header.stamp;
+    input_points_ = static_cast<std::size_t>(snapshot->width) * snapshot->height;
     if (snapshot->header.frame_id != odom_frame_) {
       result.reason = "local_map_frame_mismatch";
       return result;
@@ -243,11 +645,14 @@ class NavigationLocalizer : public rclcpp::Node {
     const auto age = (get_clock()->now() - rclcpp::Time(snapshot->header.stamp)).seconds();
     if (max_local_map_age_sec_ > 0.0 &&
         (age > max_local_map_age_sec_ || age < -1.0)) {
+      if(keyframe_attempt_) initializer_->resetConfirmation();
       result.reason = "local_map_stale_or_future_dated";
       return result;
     }
 
+    force_global_next_ = false;
     try {
+      captureInput(*snapshot, keyframe_attempt_ ? "keyframe" : (try_prior ? "prior" : "global"), snapshot_topic);
       auto source = pcl::PointCloud<Point>::Ptr(new pcl::PointCloud<Point>());
       pcl::fromROSMsg(*snapshot, *source);
       if (source->empty()) {
@@ -259,6 +664,7 @@ class NavigationLocalizer : public rclcpp::Node {
       filter.setInputCloud(source);
       pcl::PointCloud<Point> sampled;
       filter.filter(sampled);
+      voxel_points_ = sampled.size();
       if (sampled.empty()) {
         result.reason = "empty_voxelized_local_map";
         return result;
@@ -270,11 +676,62 @@ class NavigationLocalizer : public rclcpp::Node {
                   static_cast<std::size_t>(snapshot->width) * snapshot->height,
                   source->size(), sampled.size(), voxel_resolution_);
       const auto start = Clock::now();
-      const auto registration = registration_->align(sampled, *map_cloud_);
+      kiss_matcher::LocalizationResult registration;
+      if (try_prior) {
+        attempt_mode_ = "prior_vgicp";
+        registration = registration_->alignWithPrior(sampled, *map_cloud_, prior, prior_margin_);
+      }
+      if (try_prior && !registration.valid) {
+        result.registration_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
+        diagnostics_=registration;result.overlap_percent=registration.overlap_percent;
+        result.reason="prior_registration_rejected";pending_.reset();
+        if(keyframes_enabled_){recovering_candidates_=true;force_global_next_=true;initializer_->reset();initialization_reference_ns_=0;}
+        RCLCPP_WARN(get_logger(),"Prior VGICP rejected; no coarse fallback. Next fresh input uses %s",keyframes_enabled_?"database candidates with two-window confirmation":"prior VGICP until expiry; then explicit reinitialization required");
+        return result;
+      }
+      if (!try_prior) {
+        if (multistart_enabled_) {
+          try {
+            initialization_odom_=snapshotOdom(snapshot->header.stamp);
+            initialization_stamp_=rclcpp::Time(snapshot->header.stamp).nanoseconds();
+            initialization_tf_valid_=true;
+          } catch(const std::exception &error) {
+            initializer_->reset();initialization_reference_ns_=0;
+            result.reason="initialization_tf_unavailable";
+            initialization_decision_.reason=result.reason;
+            RCLCPP_WARN(get_logger(),"REGION_INIT exact snapshot TF unavailable: %s",error.what());
+            return result;
+          }
+        }
+        registration = alignInitialized(sampled);
+        RCLCPP_INFO(get_logger(), "Registration mode: %s", attempt_mode_.c_str());
+      } else {
+        RCLCPP_INFO(get_logger(), "Registration mode: prior VGICP (coarse inliers not applicable)");
+      }
       result.registration_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+      diagnostics_ = registration;
       result.inliers = static_cast<std::uint32_t>(registration.num_final_inliers);
       result.overlap_percent = registration.overlap_percent;
+      if (multistart_enabled_) {
+        const double completed_age = (get_clock()->now() - rclcpp::Time(result.local_map_stamp)).seconds();
+        if (max_local_map_age_sec_ > 0 && (completed_age > max_local_map_age_sec_ || completed_age < -1.0)) {
+          if (completed_age < -1.0) initializer_->reset();
+          else initializer_->resetConfirmation();
+          initialization_reference_ns_=initializer_->referenceStamp();
+          result.reason="initialization_input_expired_during_registration";
+          return result;
+        }
+      }
+      if (multistart_enabled_ && initialization_tf_valid_ && !initialization_decision_.ready) {
+        result.reason=initialization_decision_.reason;
+        if(result.reason=="initialization_wait_confirmation" && initialization_decision_.selected>=0) {
+          result.matched=true;
+          result.candidate_map_to_odom=toTransform(registration.target_T_source,map_frame_,odom_frame_,
+              rclcpp::Time(snapshot->header.stamp,get_clock()->get_clock_type()));
+        }
+        return result;  // No pending candidate: accept_candidate cannot bypass this gate.
+      }
       if (!registration.valid) {
         result.reason = "registration_rejected";
         return result;
@@ -291,24 +748,29 @@ class NavigationLocalizer : public rclcpp::Node {
       }
       if (result.has_previous) {
         try {
+          Eigen::Matrix4d odom_T_base;
+          if (multistart_enabled_) {
+            odom_T_base = initialization_tf_valid_ ? initialization_odom_ : snapshotOdom(snapshot->header.stamp);
+          } else {
           const auto odom_to_base = tf_buffer_->lookupTransform(
               odom_frame_, base_frame_, tf2::TimePointZero,
               tf2::durationFromSec(0.2));
           const auto &translation = odom_to_base.transform.translation;
           const auto &rotation = odom_to_base.transform.rotation;
-          Eigen::Matrix4d odom_T_base = Eigen::Matrix4d::Identity();
+          odom_T_base = Eigen::Matrix4d::Identity();
           odom_T_base.block<3, 3>(0, 0) =
               Eigen::Quaterniond(rotation.w, rotation.x, rotation.y, rotation.z)
                   .toRotationMatrix();
           odom_T_base.block<3, 1>(0, 3) =
               Eigen::Vector3d(translation.x, translation.y, translation.z);
+          }
           const Eigen::Matrix4d old_map_T_base = previous * odom_T_base;
           const Eigen::Matrix4d new_map_T_base = candidate * odom_T_base;
           const Eigen::Matrix4d delta = old_map_T_base.inverse() * new_map_T_base;
           result.translation_delta_m = delta.block<3, 1>(0, 3).norm();
           result.rotation_delta_deg = rotationDegrees(delta.block<3, 3>(0, 0));
           result.delta_valid = true;
-        } catch (const tf2::TransformException &error) {
+        } catch (const std::exception &error) {
           RCLCPP_WARN(get_logger(), "Cannot compare robot poses: %s", error.what());
         }
       }
@@ -318,14 +780,17 @@ class NavigationLocalizer : public rclcpp::Node {
           (result.translation_delta_m <= max_auto_translation_m_ &&
            result.rotation_delta_deg <= max_auto_rotation_deg_));
       if (apply_if_safe && jump_is_safe) {
-        apply(candidate, result);
-        result.reason = "applied";
+        if (apply(candidate, result)) result.reason = "applied";
       } else {
         result.reason = !apply_if_safe ? "preview_only" :
             (result.has_previous && !result.delta_valid ?
              "base_transform_unavailable" : "jump_exceeds_limit");
         result.candidate_id = std::to_string(++candidate_sequence_);
-        pending_ = PendingCandidate{result.candidate_id, candidate, result, Clock::now()};
+        pending_ = PendingCandidate{result.candidate_id, candidate, result, Clock::now(), std::nullopt};
+        if(multistart_enabled_) {
+          try {pending_->snapshot_odom=snapshotOdom(result.local_map_stamp);}
+          catch(const std::exception &) {pending_.reset();result.candidate_id.clear();}
+        }
       }
       RCLCPP_INFO(get_logger(),
                   "Localization: %s; inliers=%u overlap=%.2f%% delta=%.3f m, %.2f deg",
@@ -339,16 +804,37 @@ class NavigationLocalizer : public rclcpp::Node {
     }
   }
 
-  void apply(const Eigen::Matrix4d &map_T_odom, Result &result) {
+  bool apply(const Eigen::Matrix4d &map_T_odom, Result &result) {
     {
-      std::lock_guard<std::mutex> lock(state_mutex_);
+      // Input reset and state update must be atomic with respect to input callbacks.
+      std::scoped_lock lock(input_mutex_, state_mutex_);
+      if (multistart_enabled_) {
+        const double age = (get_clock()->now() - rclcpp::Time(result.local_map_stamp)).seconds();
+        if (input_time_reset_ || (max_local_map_age_sec_ > 0 && (age > max_local_map_age_sec_ || age < -1.0))) {
+          result.reason=input_time_reset_ ? "initialization_epoch_changed" : "initialization_input_expired_before_apply";
+          result.applied=false;
+          if (input_time_reset_ || age < -1.0) initializer_->reset();
+          else initializer_->resetConfirmation();
+          initialization_reference_ns_=initializer_->referenceStamp();
+          return false;
+        }
+      }
       applied_map_T_odom_ = map_T_odom;
       has_applied_ = true;
       last_success_stamp_ = get_clock()->now();
+      last_apply_wall_ = Clock::now();
       result.last_success_stamp = last_success_stamp_;
     }
     result.applied = true;
+    if (initializer_) initializer_->reset();
+    initialization_reference_ns_=0;
+    if (active_region_id_ >= 0) {
+      RCLCPP_INFO(get_logger(), "Region hint %d consumed after applied result; subsequent tracking uses full map; recovery uses configured VGICP candidates", active_region_id_);
+      active_region_id_ = -1;
+    }
+    force_global_next_ = false;recovering_candidates_=false;
     publishTf();
+    return true;
   }
 
   Result acceptCandidate(const std::string &id) {
@@ -363,11 +849,21 @@ class NavigationLocalizer : public rclcpp::Node {
       result.reason = "candidate_expired";
       return result;
     }
+    if(multistart_enabled_) {
+      try {
+        bool time_reset=false;
+        {std::lock_guard<std::mutex> lock(input_mutex_);time_reset=input_time_reset_;}
+        if(time_reset || !pending_->snapshot_odom ||
+            (snapshotOdom(pending_->result.local_map_stamp)-*pending_->snapshot_odom).norm()>1e-5)
+          throw std::runtime_error("pending candidate odom epoch changed");
+      } catch(const std::exception &) {
+        pending_.reset();result.reason="candidate_snapshot_tf_unavailable_or_changed";return result;
+      }
+    }
     result = pending_->result;
     result.completed_stamp = get_clock()->now();
     result.candidate_id.clear();
-    apply(pending_->map_T_odom, result);
-    result.reason = "candidate_accepted";
+    if (apply(pending_->map_T_odom, result)) result.reason = "candidate_accepted";
     pending_.reset();
     return result;
   }
@@ -381,25 +877,21 @@ class NavigationLocalizer : public rclcpp::Node {
     }
     if (initialized && periodic_interval_sec_ == 0.0) return;
     const double interval = initialized ? periodic_interval_sec_ : retry_interval_sec_;
-    if (last_attempt_ &&
-        std::chrono::duration<double>(now - *last_attempt_).count() < interval) return;
+    if (last_completed_ &&
+        std::chrono::duration<double>(now - *last_completed_).count() < interval) return;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
       if (!latest_local_map_) return;
     }
-    last_attempt_ = now;
     auto result = runLocalization(true);
     result.completed_stamp = get_clock()->now();
     status_pub_->publish(result);
   }
 
   void publishTf() {
-    Eigen::Matrix4d pose;
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      if (!has_applied_) return;
-      pose = applied_map_T_odom_;
-    }
+    std::scoped_lock lock(input_mutex_, state_mutex_);
+    if (!has_applied_ || (multistart_enabled_ && input_time_reset_)) return;
+    const Eigen::Matrix4d pose = applied_map_T_odom_;
     tf_broadcaster_->sendTransform(toTransform(pose, map_frame_, odom_frame_,
                                              get_clock()->now()));
   }
@@ -409,13 +901,47 @@ class NavigationLocalizer : public rclcpp::Node {
   std::string base_frame_;
   double voxel_resolution_ = 0.1;
   double max_local_map_age_sec_ = 10.0;
-  double retry_interval_sec_ = 5.0;
-  double periodic_interval_sec_ = 60.0;
+  double retry_interval_sec_ = 1.0;
+  double periodic_interval_sec_ = 1.0;
   double max_auto_translation_m_ = 1.0;
   double max_auto_rotation_deg_ = 15.0;
   double candidate_timeout_sec_ = 60.0;
 
+  bool multistart_enabled_ = false, initialization_tf_valid_ = false;
+  bool input_time_reset_ = false;  // guarded by input_mutex_
+  double initialization_tf_timeout_ = 0.2;
+  std::unique_ptr<kiss_matcher::RegionInitializer> initializer_;
+  kiss_matcher::InitializationDecision initialization_decision_;
+  Eigen::Matrix4d initialization_odom_ = Eigen::Matrix4d::Identity();
+  std::int64_t initialization_stamp_ = 0, initialization_reference_ns_ = 0;
+  std::size_t seed_candidates_ = 0;
+  std::string initialization_selected_seed_;
+  std::ofstream candidate_metrics_;
+  bool use_prior_ = false;
+  double prior_margin_ = 5.0;
+  double prior_max_age_ = 30.0;
+  std::string global_topic_;
+  std::optional<Clock::time_point> last_apply_wall_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_global_map_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_sub_;
   pcl::PointCloud<Point>::Ptr map_cloud_;
+  kiss_matcher::RegionMap region_map_;
+  std::string region_labels_csv_;
+  bool keyframes_enabled_=false,keyframe_attempt_=false;
+  std::string keyframe_map_sha_,keyframe_library_sha_,keyframe_profile_sha_;
+  int keyframe_region_id_=2,keyframe_expected_=28;
+  Keyframes::ConstSharedPtr latest_keyframes_;
+  rclcpp::Subscription<Keyframes>::SharedPtr keyframe_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr selected_input_pub_;
+  std::vector<std::pair<std::string,Eigen::Matrix4d>> keyframe_guesses_;
+  int active_region_id_ = -1, attempt_region_id_ = -1;
+  bool force_global_next_ = false, recovering_candidates_ = false, region_did_fallback_ = false;
+  std::string attempt_region_name_;
+  std::size_t region_target_points_ = 0;
+  double region_ms_ = 0;
+  kiss_matcher::LocalizationResult region_diagnostics_;
+  bool hierarchy_enabled_=false;double hierarchy_confidence_=80;
+  std::unique_ptr<kiss_matcher::LocalizationRegistration> screening_;
   std::unique_ptr<kiss_matcher::LocalizationRegistration> registration_;
   std::mutex input_mutex_;
   bool first_local_map_logged_ = false;
@@ -424,9 +950,17 @@ class NavigationLocalizer : public rclcpp::Node {
   bool has_applied_ = false;
   Eigen::Matrix4d applied_map_T_odom_ = Eigen::Matrix4d::Identity();
   rclcpp::Time last_success_stamp_;
-  std::optional<Clock::time_point> last_attempt_;
+  std::optional<Clock::time_point> last_completed_;
   std::optional<PendingCandidate> pending_;
   std::uint64_t candidate_sequence_ = 0;
+  std::uint64_t attempt_count_ = 0, matched_count_ = 0, applied_count_ = 0;
+  std::size_t input_points_ = 0, voxel_points_ = 0;
+  std::string attempt_mode_ = "not_run";
+  kiss_matcher::LocalizationResult diagnostics_;
+  std::vector<double> durations_;
+  std::ofstream metrics_;
+  bool capture_inputs_ = false;
+  rclcpp::Publisher<kiss_matcher_localization::msg::LocalizationInput>::SharedPtr input_capture_pub_;
 
   rclcpp::CallbackGroup::SharedPtr input_group_;
   rclcpp::CallbackGroup::SharedPtr registration_group_;
@@ -434,6 +968,7 @@ class NavigationLocalizer : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr local_map_sub_;
   rclcpp::Publisher<Result>::SharedPtr status_pub_;
   rclcpp::Service<Relocalize>::SharedPtr relocalize_service_;
+  rclcpp::Service<SetRegion>::SharedPtr region_service_;
   rclcpp::Service<AcceptCandidate>::SharedPtr accept_service_;
   rclcpp::TimerBase::SharedPtr trigger_timer_;
   rclcpp::TimerBase::SharedPtr tf_timer_;

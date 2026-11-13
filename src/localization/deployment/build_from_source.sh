@@ -2,6 +2,11 @@
 set -euo pipefail
 
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Retain the established ASCII alias when this workspace lives under 人形.
+if [[ "$workspace" == *人形* && -d /home/pc/kiss_localization_ws1.1 ]] &&
+   [[ "$workspace" -ef /home/pc/kiss_localization_ws1.1 ]]; then
+  workspace=/home/pc/kiss_localization_ws1.1
+fi
 vendor="$workspace/vendor"
 ros_setup="/opt/ros/humble/setup.bash"
 algorithm_build="$workspace/build_algorithms"
@@ -50,8 +55,29 @@ cmake -S "$vendor/small_gicp" -B "$algorithm_build/small_gicp" \
 cmake --build "$algorithm_build/small_gicp" --parallel "$jobs"
 cmake --install "$algorithm_build/small_gicp"
 
+# rosidl's IDL file list must be generated under a real ASCII path.
+# The workspace alias alone is insufficient after its physical directory moved.
+ros_build="${LOCALIZATION_BUILD_BASE:-$workspace/build}"
+if [[ "$(readlink -m "$ros_build")" == *人形* ]]; then
+  ros_build="${XDG_CACHE_HOME:-$HOME/.cache}/mid360_region_build"
+fi
 cd "$workspace"
 export CMAKE_PREFIX_PATH="$prefix:${CMAKE_PREFIX_PATH:-}"
 export LD_LIBRARY_PATH="$prefix/lib:${LD_LIBRARY_PATH:-}"
-colcon build --packages-select \
-  kiss_matcher_localization pcd_cloud_publisher localization_visualizer
+colcon --log-base "$workspace/log" build \
+  --base-paths "$workspace/src" --build-base "$ros_build" \
+  --install-base "$workspace/install" --packages-select \
+  kiss_matcher_localization pcd_cloud_publisher localization_visualizer \
+  localization_path_recorder
+
+# Keep the active large map in src; do not duplicate ~0.9GB into install.
+space_map="$workspace/src/localization/maps/building_split_space.pcd"
+installed_space_map="$workspace/install/kiss_matcher_localization/share/kiss_matcher_localization/maps/building_split_space.pcd"
+if [[ -f "$space_map" ]]; then
+  mkdir -p "$(dirname "$installed_space_map")"
+  if [[ -e "$installed_space_map" && ! -L "$installed_space_map" ]]; then
+    echo "Refusing to replace a regular installed map: $installed_space_map" >&2
+    exit 1
+  fi
+  ln -sfn "$space_map" "$installed_space_map"
+fi

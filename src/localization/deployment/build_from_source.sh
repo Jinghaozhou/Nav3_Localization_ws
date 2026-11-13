@@ -56,3 +56,15 @@ export LD_LIBRARY_PATH="$prefix/lib:${LD_LIBRARY_PATH:-}"
 colcon build --packages-select \
   kiss_matcher_localization pcd_cloud_publisher localization_visualizer \
   localization_path_recorder
+
+# The active map is deployment data and is excluded from the package install.
+space_map="$workspace/src/localization/maps/building_split_space.pcd"
+installed_space_map="$workspace/install/kiss_matcher_localization/share/kiss_matcher_localization/maps/building_split_space.pcd"
+if [[ -f "$space_map" ]]; then
+  mkdir -p "$(dirname "$installed_space_map")"
+  if [[ -e "$installed_space_map" && ! -L "$installed_space_map" ]]; then
+    echo "Refusing to replace a regular installed map: $installed_space_map" >&2
+    exit 1
+  fi
+  ln -sfn "$space_map" "$installed_space_map"
+fi

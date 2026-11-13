@@ -1,129 +1,75 @@
 # 导航定位接口
 
-`navigation_localizer` 用 FastLIO 持续发布的局部地图与静态全局 PCD
-配准。局部地图的每个点必须在 `odom` 坐标系中，消息的
-`header.frame_id` 也必须为 `odom`；全局 PCD 的点坐标必须在 `map`
-坐标系中。配准直接得到 `T_map_odom`。FastLIO 继续提供
-`odom -> base_link`，导航系统使用 `map -> odom -> base_link`。
+全局 PCD 的点坐标为 `map`；实时点云的点坐标及 `header.frame_id`
+必须为 `odom`。Fast-LIO 提供 `odom → base_link`，本包在成功应用后
+提供 `map → odom`。区域候选初始化要在点云采集时间读取
+`odom → base_link`，不能用最新 TF 代替。
 
-尚未接入 FastLIO 时，可先用独立的
-[`pcd_cloud_publisher`](../pcd_cloud_publisher/README.md) 包发布
-`/local_map`，检查输入话题和定位服务。该调试包不属于定位包的
-构建依赖。
-可用独立的
-[`localization_visualizer`](../localization_visualizer/README.md) 包在
-RViz 中叠加全局地图与定位后的局部地图；它也不属于定位包的构建依赖。
+## 首次定位与跟踪
 
-新节点与原有 `inter_frame_alignment` PCD 演示节点是两个入口。
-导航时只启动 `navigation_localizer`，避免出现两个 TF 发布者。
+`navigation_localizer` 不构造 KISS 粗配准器。首次定位需要区域候选位姿
+或 `/localization/keyframe_candidates`。每个候选先预测局部地图在全局图的位置，
+裁剪目标点云，再运行 VGICP。候选还需满足重叠率、精配内点、残差、
+修正量及歧义检查，且至少两个不同时间的输入窗口给出一致结果后才能应用。
+`space_2` 的实验候选配置见 `config/region_initialization_space.yaml`。
 
-## 运行
+成功应用后，开启 `use_prior_tracking` 时用上次应用的 `map ← odom`
+作为先验，对裁剪后的地图运行 VGICP；先验失败时进入候选恢复流程，
+不执行 KISS 回退。`global_local_map_topic` 可提供较大的初始化／恢复窗口。
+已应用位姿的自动更新仍受 `max_auto_translation_m`、
+`max_auto_rotation_deg` 限制；超限结果保留为待确认候选。
 
-```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
-  local_map_topic:=/local_map
-```
+## 话题
 
-默认地图为安装在功能包中的 `maps/3_part.pcd`（众创空间五号楼整体地图）。
-也可通过 `map_pcd:=/absolute/path/to/global_map.pcd` 指定其他地图。
-若使用 Fast-LIO 持续累积的 `/Laser_map`，需传入
-`local_map_topic:=/Laser_map local_map_reliability:=reliable`；
-`scans.pcd` 可用工作空间根目录下的
-`map_pcd:="$PWD/src/localization/maps/scans.pcd"` 直接指定，无需安装该地图。
-地图文件作为部署数据，需在目标机器上单独复制；详见
-[`maps/README.md`](maps/README.md)。
+| 名称 | 类型 | 发布／订阅条件 |
+| --- | --- | --- |
+| `/localization/keyframe_candidates` | `kiss_matcher_localization/msg/KeyframeCandidates` | 可选订阅；外部检索器提供短时点云、候选 `map ← odom`、ID、评分、区域、哈希和时间窗口 |
+| `/localization/selected_cloud` | `sensor_msgs/msg/PointCloud2` | 启用关键帧功能后，发布实际选用的原始点云 |
+| `/localization/input_snapshot` | `kiss_matcher_localization/msg/LocalizationInput` | 开启 `record_inputs` 且有订阅者时，记录尝试编号、阶段、原话题、选择时间及原始点云 |
+| `/localization/status` | `kiss_matcher_localization/msg/LocalizationResult` | 每次尝试／确认后发布；reliable + transient-local |
 
-全局地图启动时读取并体素化一次；局部地图订阅使用 sensor-data QoS，
-持续接收并只保留最新的 `PointCloud2`。启动时获得有效局部地图后
-自动运行无先验的全局定位（KISS 粗配准 + VGICP 精配准）；成功应用后按
-`periodic_interval_sec` 周期运行带 TF 初值的局部定位（仅 VGICP）。
-局部配准未收敛、重叠率不足、修正过大或无法取得 TF 初值时，会在同一次
-尝试中用同一帧点云回退到全局定位。回退结果仍须通过质量与自动应用检查。
-将该参数设为 `0.0` 可关闭周期定位，保留启动定位和服务调用。
-首次定位失败，或已定位后一次自动配准失败时，按 `retry_interval_sec`
-重试。配准成功但因位姿跳变成为待确认候选时，不用短间隔重试覆盖候选。
+`KeyframeCandidates` 必须和当前地图、关键帧库、配置的 SHA-256 匹配；
+候选个数、ID、时间窗口和位姿也会检查。检索器位于外部
+`wyn/导航工程/mid360_lidar/scripts/keyframe_retriever.py`，订阅
+`/fast_lio/local_cloud`、`/fast_lio/odom`、`/fast_lio/gravity`。
+wyn 当前库为 40 帧；启动时应传入实际数量，不使用启动文件中的历史默认值 28。
 
-局部输入点云本身在 `odom` 下，所以 VGICP 所需初值就是 TF 中现成的
-`map ← odom`，无需经过雷达坐标系换算。节点查询最新的 `map ← odom`，
-并检查其时效不超过 `max_prior_tf_age_sec`。首次定位仍强制使用全局模式；
-局部服务在没有
-已应用位姿时返回 `no_local_prior`。后续 TF 中的
-`map → odom` 来自本节点上次应用的结果，因此局部初值是里程计预测，
-不是独立的全局观测；出现大幅漂移时依靠全局回退重新定位。
-
-## 服务和状态
+## 服务
 
 ```bash
+ros2 service call /localization/set_region \
+  kiss_matcher_localization/srv/SetRegion "{region: 'space_2'}"
 ros2 service call /localization/relocalize \
-  kiss_matcher_localization/srv/Relocalize \
-  "{mode: 1, apply_if_safe: true}"
-
-# 已有定位后，仅用 TF 初值运行 VGICP；不自动回退全局
-ros2 service call /localization/relocalize \
-  kiss_matcher_localization/srv/Relocalize \
-  "{mode: 2, apply_if_safe: true}"
-
+  kiss_matcher_localization/srv/Relocalize "{apply_if_safe: true}"
 ros2 topic echo /localization/status
 ```
 
-`/localization/relocalize` 使用最新局部地图快照立即运行一次配准。
-`mode=1` 强制全局，`mode=2` 强制局部且失败不回退；`mode=0` 按自动规则
-选择局部或全局，原先只传 `apply_if_safe` 的调用也会得到默认值 `0`。
-无效模式返回 `invalid_mode`。`apply_if_safe=false` 始终只返回候选，
-不更新 TF。响应为 `LocalizationResult`：
+`SetRegion` 接受区域 ID、CSV 中的名称或当前所在地描述；空值、`all`、
+`全图` 会清除区域提示。响应包含 `success`、`region_id`、
+`region_name`、`target_points`、`message`。区域提示在成功应用后消耗。
+`Relocalize` 请求只有 `apply_if_safe`，响应为 `LocalizationResult`；
+`false` 只计算候选，不应用 TF。当前服务没有全局／局部 `mode` 字段。
 
-| 字段 | 含义 |
-| --- | --- |
-| `matched` | 本次选定的配准模式通过质量检查 |
-| `applied` | 候选 `map -> odom` 已应用 |
-| `requested_mode`、`actual_mode` | 请求模式和最终执行的配准模式（`global` / `local`）；尚未运行配准时后者为空 |
-| `fallback_used`、`fallback_reason` | 自动模式是否从局部回退全局及回退原因 |
-| `reason` | 应用、预览、超出跳变阈值、输入问题或配准失败原因 |
-| `candidate_map_to_odom` | 本次候选变换；仅 `matched=true` 时有效 |
-| `has_previous` | 本次尝试前是否已有已应用的定位 |
-| `delta_valid` | 是否成功利用 `odom -> base_link` 比较新旧机器人全局位姿 |
-| `translation_delta_m` | 同一机器人里程计位姿下，新旧 `map -> base_link` 的平移差（m）；仅 `delta_valid=true` 时有效 |
-| `rotation_delta_deg` | 同一机器人里程计位姿下，新旧 `map -> base_link` 的三维旋转差（°）；仅 `delta_valid=true` 时有效 |
-| `inliers`、`overlap_percent` | KISS 粗配准内点数和 VGICP 重叠率（%）；局部模式的 `inliers=0` |
-| `registration_ms` | 本次配准耗时（ms）；自动回退时包含局部和全局两次尝试，不含 ROS/PCL 转换与体素化 |
-| `local_map_stamp` | 本次局部地图的采集时间 |
-| `last_success_stamp` | 最近一次应用定位结果的时间；此前从未成功时为零 |
-| `candidate_id` | 成功但未应用时的候选编号 |
-
-首次定位若 `apply_if_safe=true`，通过质量检查即可应用。
-已有定位时，只有 `delta_valid=true`，且机器人位姿差同时不超过
-`max_auto_translation_m` 与 `max_auto_rotation_deg` 才自动应用。
-通过质量检查还要求 VGICP 实际收敛，变换有效；局部模式还要求修正量不超过
-`local_max_correction_translation_m` 和 `local_max_correction_rotation_deg`。
-
-成功但未应用的结果可在 `candidate_timeout_sec` 内确认：
+质量通过但未自动应用的结果可在 `candidate_timeout_sec` 内确认：
 
 ```bash
 ros2 service call /localization/accept_candidate \
-  kiss_matcher_localization/srv/AcceptCandidate \
-  "{candidate_id: '返回的编号'}"
+  kiss_matcher_localization/srv/AcceptCandidate "{candidate_id: '返回的编号'}"
 ```
 
-确认服务应用已有候选，不再重新计算配准。新定位尝试会取代旧候选。
-服务、启动和周期定位使用同一个互斥执行组；局部地图接收与 TF
-广播有各自的执行组。每次尝试及候选确认都会在
-`/localization/status` 发布同一结构的结果；状态话题使用
-reliable + transient-local QoS。
+`LocalizationResult` 的 `matched` 表示本次候选通过质量检查，
+`applied` 表示已更新 TF；`reason` 解释拒绝或等待原因。
+`candidate_map_to_odom` 在 `matched=true` 时有效，
+`delta_valid` 为真时平移／旋转差才有意义。
+`inliers` 是历史 KISS 粗配准内点字段，连续定位中为 0；
+使用 `overlap_percent`、`registration_ms`、时间戳和 `candidate_id`
+监控当前行为。
 
-## TF 和失效处理
+## 地图与配置
 
-节点在第一次应用定位结果后以 `10 Hz` 发布 `map -> odom`。
-失败或大幅变化暂缓应用时保留上一次变换，状态里的 `applied=false`
-和 `last_success_stamp` 告诉导航系统结果的新鲜程度。发布 TF 时
-使用当前 ROS 时间；状态保留局部地图的原始时间戳。导航系统应
-依据状态自行决定多久以前的全局定位仍可用。
-使用局部模式时，雷达外参 TF 必须与建图配置一致。若 `/Laser_map` 随运行
-不断累积到全局地图之外，重叠率可能下降，即使初值正确也会被拒绝；
-需要结合实际场景调整输入范围或重叠率判定。
-
-默认参数见 [`config/navigation_localization.yaml`](config/navigation_localization.yaml)。
-`1.0 m` 与 `15.0°` 是初始自动应用阈值，需结合实测漂移与导航
-允许的位姿跳变调整。局部地图过期、`frame_id` 不符、无点或配准
-质量不足都会拒绝本次结果。
+默认地图 `building_split_space.pcd` 及区域名称 CSV 在 `maps/`。
+地图包含 `region_id`，区域由点标签筛出；无标签地图无法接受区域提示。
+`config/navigation_localization.yaml` 是裸节点默认配置，
+`config/continuous_localization.yaml` 是 wyn 连续定位配置，启用先验跟踪、
+设置 1 秒周期及 60% 最小重叠率。区域候选、关键帧与分层筛选均为显式开关。
+完整命令见[工作空间 README](../../README.md#3-接入-fast-lio-连续定位)。

@@ -18,7 +18,7 @@ launch:
       exec: localization_visualizer_node
       namespace: localization_visualization
       name: localization_visualizer
-      output: screen
+      output: own_log
       param:
         - {name: map_pcd, value: $(var map_pcd)}
         - {name: local_map_topic, value: $(var local_map_topic)}
@@ -36,6 +36,6 @@ launch:
       pkg: rviz2
       exec: rviz2
       name: localization_rviz
-      output: screen
+      output: own_log
       args: >
         -d $(var rviz_path)

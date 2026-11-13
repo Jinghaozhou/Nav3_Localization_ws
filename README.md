@@ -3,9 +3,9 @@
 > 本项目是基于 [KISS-Matcher](https://github.com/MIT-SPARK/KISS-Matcher)
 > 开发的独立 ROS 2 定位扩展，不属于 MIT-SPARK 官方项目。
 
-本目录用于从本地算法源码构建定位模块并验证部署。当前工作空间已在 ROS 2 Humble
-完成源码构建和 PCD 离线定位验证，并验证了 Fast-LIO 局部地图话题接入；
-实时配准效果与导航系统仍待联调。
+本目录用于从本地算法源码构建定位模块并验证部署。历史 KISS 演示流程
+已在 ROS 2 Humble 完成 PCD 离线验证；当前持续导航定位采用 wyn 的
+候选位姿加 VGICP 流程，已完成构建、地图加载和接口检查，仍需现场匹配验证。
 
 定位实现参考 [MIT-SPARK/KISS-Matcher](https://github.com/MIT-SPARK/KISS-Matcher)。
 项目自有代码采用 [MIT 许可](LICENSE)；随附算法及第三方源码的来源、
@@ -56,94 +56,84 @@ grep -E '^(robin|kiss_matcher|small_gicp)_DIR:' \
 前四项应都指向本工作空间的 `install/`，最后三项应指向
 `external/lib/cmake/`。检查动态库的命令也见源码构建说明。
 
-## 3. 使用 PCD 调试输入
+## 3. 接入 Fast-LIO 连续定位
 
-在三个终端分别切换到工作空间根目录，再执行对应命令：
+当前导航定位使用 wyn 实测分区地图和 VGICP：首次定位从区域候选位姿开始，
+成功后使用已有位姿跟踪；连续定位节点不运行 KISS 粗配准。
+`inter_frame_alignment` 历史演示节点仍保留 KISS 代码。
 
-```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
-ros2 launch pcd_cloud_publisher local_map_from_pcd.launch.yaml
-```
+Fast-LIO 需要发布 `odom → base_link` TF、`odom` 坐标系下的
+`/fast_lio/local_map`；wyn 配置还可订阅较大的 `/fast_lio/local_map_global`
+作为初始化或恢复输入。定位终端和 Fast-LIO 使用同一个 `ROS_DOMAIN_ID`。
+本机已放入 `building_split_space.pcd`、区域名称表及 `space_2` 的
+15 个候选位姿。候选位姿来自特定安装姿态的实验标定，现场使用前应核对。
 
-```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
-ros2 launch kiss_matcher_localization navigation_localization.launch.yaml
-```
-
-```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
-ros2 launch localization_visualizer localization_visualizer.launch.yaml \
-  map_pcd:="$PWD/src/localization/maps/3_part.pcd"
-```
-
-当前工作空间已包含全局地图 `src/localization/maps/3_part.pcd` 和调试点云
-`src/pcd_cloud_publisher/clouds/part_1_hard.pcd`。完整导航接口见
-[导航接口文档](src/localization/NAVIGATION_INTERFACE.md)。
-
-上述两份 PCD 是本机验证数据，已被 Git 忽略；从 GitHub 克隆后需要自行
-提供数据，或通过 launch 参数指定其他 PCD 路径。
-
-2026-10-12 的 Humble 离线测试中，首次定位成功应用：43 个 KISS 内点、
-99.69% VGICP 重叠率，`map → odom` 和对齐点云均已发布。调试 PCD 不提供
-`odom → base_link`，因此后续重定位虽匹配成功，但候选结果不会自动应用。
-
-## 4. 接入 Fast-LIO 局部地图
-
-Fast-LIO 发布 `/fast_lio/local_map`（点坐标与 `header.frame_id` 均为
-`odom`）及 `odom → base_link` TF 后，在工作空间根目录启动定位：
+在工作空间根目录启动 `space_2` 区域候选定位：
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 export LD_LIBRARY_PATH="$PWD/external/lib:${LD_LIBRARY_PATH:-}"
 ros2 launch kiss_matcher_localization navigation_localization.launch.yaml \
-  map_pcd:="$PWD/src/localization/maps/scans.pcd" \
-  local_map_topic:=/Laser_map \
+  map_pcd:="$PWD/src/localization/maps/building_split_space.pcd" \
+  region_labels_csv:="$PWD/src/localization/maps/region_labels.csv" \
+  config_path:="$PWD/src/localization/config/continuous_localization.yaml" \
+  initial_region:=space_2 \
+  region_multistart_enabled:=true \
+  region_seed_file:="$PWD/src/localization/config/region_initialization_space.yaml" \
+  local_map_topic:=/fast_lio/local_map \
   local_map_reliability:=reliable
 ```
 
-此处的 `scans.pcd` 是当前本机的全局地图文件，不随 Git 分发。运行时无需
-`pcd_cloud_publisher`；定位结果见 `/localization/status`，成功应用后发布
-`map → odom`。`/Laser_map` 是 Fast-LIO 持续累积的地图，体量会随运行增加；
-使用滑动窗口点云时改为 `local_map_topic:=/fast_lio/local_map` 并省略
-`local_map_reliability`。是否匹配成功取决于地图与实时点云的实际重叠情况。
-首次定位使用 KISS + VGICP；成功后周期定位优先以 TF 位姿为初值运行
-VGICP，失败再回退全局匹配。局部模式直接读取已有的 `map → odom` TF；
-服务可指定全局或局部模式，见[导航接口文档](src/localization/NAVIGATION_INTERFACE.md)。
+候选初始化要求输入点云和相同时间的 `odom → base_link` TF。
+其他区域已有标签，但当前没有对应的候选位姿配置；不能仅切换 `initial_region`
+就期望首次定位成功。关键帧候选模式是可选实验流程，其
+`/localization/keyframe_candidates` 由 `wyn/导航工程/mid360_lidar`
+中的检索器发布，还需要对应关键帧库、地图及配置哈希。详见
+[导航接口说明](src/localization/NAVIGATION_INTERFACE.md)。
 
-需要在匹配时观察两张点云，可构建 `localization_visualizer`，并在另一终端运行：
+成功应用后定位包发布 `map → odom` 和 `/localization/status`。
+手动设置当前区域：
+
+```bash
+ros2 service call /localization/set_region \
+  kiss_matcher_localization/srv/SetRegion "{region: 'space_2'}"
+ros2 service call /localization/relocalize \
+  kiss_matcher_localization/srv/Relocalize "{apply_if_safe: true}"
+```
+
+## 4. 可视化和轨迹
+
+在另一个终端启动并排比较视图：
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch localization_visualizer localization_visualizer.launch.yaml \
-  map_pcd:="$PWD/src/localization/maps/scans.pcd" \
-  local_map_topic:=/Laser_map \
+  map_pcd:="$PWD/src/localization/maps/building_split_space.pcd" \
+  local_map_topic:=/fast_lio/local_map \
   local_map_reliability:=reliable \
   map_voxel_resolution:=0.3 \
   local_voxel_resolution:=0.3
 ```
 
-一个 RViz 窗口并排显示左侧全局图和右侧未对齐的原始局部图；
-匹配成功并发布 `map → odom` 后，左侧还会叠加对齐后的局部图。
-右侧为便于比较做了显示平移，不代表定位变换。
-详见[可视化包说明](src/localization_visualizer/README.md)。
+轨迹记录节点从 `map ← base_link` TF 发布 `/localization/map_path`，
+可视化窗口以黄色轨迹和紫红色箭头显示：
 
-需要显示定位成功后的运动轨迹时，另开终端启动路径记录包：
+```bash
+ros2 launch localization_path_recorder localization_path_recorder.launch.yaml
+```
+
+## 5. 用 PCD 模拟点云输入
+
+`pcd_cloud_publisher` 可以发布 `/local_map`，用于检查订阅和显示：
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch localization_path_recorder localization_path_recorder.launch.yaml
+ros2 launch pcd_cloud_publisher local_map_from_pcd.launch.yaml
 ```
 
-节点在 `map → base_link` TF 可用后发布 `map` 坐标系的
-`/localization/map_path`；上面的 RViz 窗口会在左侧全局地图上用醒目的
-黄色轨迹和紫红色当前位置箭头显示它。定位尚未成功、TF 链不完整时不会
-生成轨迹。详见[路径记录包说明](src/localization_path_recorder/README.md)。
+候选定位还需要相同时间的 `odom → base_link` TF、适用该点云的候选位姿
+和对应全局地图；单独发布 PCD 不能完成 wyn 的首次定位流程。
+地图 PCD 是本机部署数据，已被 Git 忽略，克隆仓库后须单独提供。

@@ -45,9 +45,10 @@ patch -p1 -i src/localization/deployment/robin-local-sources.patch
 系统必须事先安装相应 ROS 2 发行版、CMake ≥ 3.22、编译工具、
 PCL、Eigen3、TBB、FLANN、LZ4、OpenMP 等依赖。
 
-当前机器的 Humble 构建和 PCD 离线运行已通过。首次定位应用成功，
-43 个内点、99.69% 重叠率；`map → odom` 与可视化对齐点云均已验证。
-后续重定位因调试数据没有 `odom → base_link` 而保留候选结果。
+历史 KISS 演示曾在 Humble 上完成 PCD 离线验证。当前
+`navigation_localizer` 已改用 wyn 的候选位姿加 VGICP 流程，
+需要带标签的地图、候选配置和同一时间的 `odom → base_link` TF；
+历史演示结果不代表新流程已经完成现场验证。
 
 ## 构建后检查
 

@@ -1,0 +1,22 @@
+# Synthetic example only. Map/base poses are NOT calibrated Building-5 positions.
+# Enabled explicitly with region_multistart_enabled and region_seed_file.
+schema_version: 1
+map_frame: map
+base_frame: base_link
+regions:
+  - region_id: 1
+    # current (legacy default): constrain current map_T_base.
+    # initial_reference: constrain candidate projected to first snapshot; permits motion.
+    position_bounds_mode: current
+    position_min: [-20.0, -20.0, -2.0]
+    position_max: [20.0, 20.0, 2.0]
+    # Rz(yaw)*Ry(pitch)*Rx(roll), degrees, paired ordered bounds; no wrapped ranges.
+    rpy_min_deg: [-30.0, -30.0, -180.0]
+    rpy_max_deg: [30.0, 30.0, 180.0]
+    seeds:
+      - id: origin
+        position: [0.0, 0.0, 0.0]
+        orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+      - id: alternate
+        position: [10.0, 0.0, 0.0]
+        orientation_xyzw: [0.0, 0.0, 0.0, 1.0]

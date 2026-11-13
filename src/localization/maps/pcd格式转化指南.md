@@ -1,6 +1,24 @@
 # 点云地图格式转换
 
-本目录保存 FAST-LIO 生成的 PCD 地图。当前 Ubuntu 安装的 CloudCompare 不支持直接读取 PCD，可先使用 PCL 工具将其转换为 PLY。
+本目录保存 FAST-LIO 生成的 PCD 地图。已安装带 PCD I/O 插件的 CloudCompare，可直接打开和另存为 PCD。下面的 PLY 转换方法保留作备用。
+
+## 直接编辑 PCD
+
+启动带插件的版本：
+
+```bash
+cloudcompare-pcd
+```
+
+在 `File -> Open` 中选择 `.pcd`；编辑后在 `File -> Save` 中选择 **PCD cloud** 格式，并使用新的文件名，避免覆盖原图。
+
+命令行也可直接打开：
+
+```bash
+cloudcompare-pcd "$PWD/src/localization/maps/building_split_space.pcd"
+```
+
+应用菜单中选择 **CloudCompare (PCD)**。上面的相对路径命令应在工作空间根目录执行。
 
 ## 首次安装转换工具
 
@@ -52,7 +70,7 @@ CloudCompare /home/jinghao/Fast_lio_ws/maps/test.ply
 在本目录将 `scans.ply` 转成新的 PCD 文件：
 
 ```bash
-cd /home/jinghao/kiss_localization_ws/src/localization/maps
+cd src/localization/maps
 pcl_ply2pcd scans.ply scans_from_ply.pcd
 ```
 

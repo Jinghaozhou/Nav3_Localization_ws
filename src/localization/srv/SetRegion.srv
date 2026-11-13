@@ -1,0 +1,9 @@
+# Numeric ID, exact CSV name, or an explicit current-location sentence.
+# Empty string / all / 全图 clears the one-shot initialization hint.
+string region
+---
+bool success
+int32 region_id
+string region_name
+uint64 target_points
+string message

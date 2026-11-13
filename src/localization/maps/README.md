@@ -1,14 +1,14 @@
 # 全局地图
 
-此目录存放导航定位使用的全局点云地图。当前本机放有
-`3_part.pcd`（众创空间五号楼整体地图，约 250 MB，21,841,914 个点）。
-地图中的点坐标必须处于导航所用的 `map` 坐标系。
+当前使用 wyn 的 `building_split_space.pcd` 作为导航参考地图，坐标属于
+`map`。它包含 `region_id` 标签；`region_labels.csv` 将 1～13 映射为
+`space_1`～`space_13`。旧的 `3_part.pcd` 保留作历史复现；两份同名
+`3_part.pcd` 在迁移前后内容不同，不能混用坐标或区域配置。
 
-`*.pcd`、`*.ply`、`*.bin` 默认不纳入 Git。部署到另一台机器时，
-请将所需地图复制到本目录后构建功能包；CMake 会把 PCD 文件安装到
-`share/kiss_matcher_localization/maps/`，但跳过体量较大的 `scans.pcd`。
-也可以在启动时通过
-`map_pcd:=/absolute/path/to/map.pcd` 使用包外地图。
-例如，在工作空间根目录可用 `map_pcd:="$PWD/src/localization/maps/scans.pcd"`。
-导航 launch 默认使用安装后的 `maps/3_part.pcd`。若该文件不存在，
-请先放入地图并重新构建，或显式指定 `map_pcd`。
+`*.pcd`、`*.ply`、`*.bin` 不纳入 Git，换机部署须另行复制地图。
+`building_split_space.pcd` 体积约 880 MB，CMake 不重复安装它；
+`build_from_source.sh` 在安装目录创建指向本机地图的软链接。
+也可在启动时显式传入
+`map_pcd:="$PWD/src/localization/maps/building_split_space.pcd"`。
+地图和 `config/region_initialization_space.yaml` 中的 `map_sha256`
+应一致。没有该地图时不能使用默认启动路径。

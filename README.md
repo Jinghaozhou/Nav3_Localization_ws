@@ -1,9 +1,9 @@
-# KISS Matcher 独立定位工作空间
+# Nav3 Localization 工作空间
 
 > 本项目是基于 [KISS-Matcher](https://github.com/MIT-SPARK/KISS-Matcher)
 > 开发的独立 ROS 2 定位扩展，不属于 MIT-SPARK 官方项目。
 
-本目录用于从本地算法源码构建定位模块并验证部署。历史 KISS 演示流程
+本工作空间 `Nav3_Localization_ws` 用于从本地算法源码构建定位模块并验证部署。历史 KISS 演示流程
 已在 ROS 2 Humble 完成 PCD 离线验证；当前持续导航定位采用 wyn 的
 候选位姿加 VGICP 流程，已完成构建、地图加载和接口检查，仍需现场匹配验证。
 
@@ -33,7 +33,9 @@ bash src/localization/deployment/build_from_source.sh
 
 脚本加载 `/opt/ros/humble`，依次构建三个算法库和四个 ROS 包；
 构建结果分别位于 `build_algorithms/`、`external/`、`build/` 和
-`install/`。迁移工作空间后，旧 CMake 构建缓存中的绝对路径需要重新生成。
+`install/`。工作空间改名或移动后，需删除旧的 `build/`、
+`build_algorithms/`、`install/` 和 `external/` 生成目录，再运行脚本重新构建；
+CMake 缓存与 ROS 安装脚本包含旧绝对路径。
 不要在构建前 source 旧 KISS-Matcher 工作空间。详细源码版本、
 补丁用途和构建后检查命令见
 [从源码构建说明](src/localization/deployment/README.md)。

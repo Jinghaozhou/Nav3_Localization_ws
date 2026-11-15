@@ -3,7 +3,7 @@
 独立工作空间的目录结构：
 
 ```text
-kiss_localization_ws/
+Nav3_Localization_ws/
 ├── src/
 │   ├── localization/             # kiss_matcher_localization
 │   ├── pcd_cloud_publisher/      # PCD 模拟输入，调试时使用

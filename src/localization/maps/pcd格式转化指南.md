@@ -41,8 +41,7 @@ command -v pcl_ply2pcd
 在工作空间根目录执行：
 
 ```bash
-cd /home/jinghao/Fast_lio_ws
-pcl_pcd2ply maps/test.pcd maps/test.ply
+pcl_pcd2ply src/localization/maps/scans.pcd /tmp/scans.ply
 ```
 
 通用格式：
@@ -54,13 +53,13 @@ pcl_pcd2ply <输入文件.pcd> <输出文件.ply>
 转换后检查：
 
 ```bash
-ls -lh maps/test.pcd maps/test.ply
+ls -lh src/localization/maps/scans.pcd /tmp/scans.ply
 ```
 
 ## 使用 CloudCompare 打开
 
 ```bash
-CloudCompare /home/jinghao/Fast_lio_ws/maps/test.ply
+cloudcompare-pcd /tmp/scans.ply
 ```
 
 也可以在 CloudCompare 中通过 `File -> Open` 选择 PLY 文件。

@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+native_only=false
+case "${1:-}" in
+  '') ;;
+  --native-only) native_only=true ;;
+  -h|--help)
+    echo "Usage: $0 [--native-only]"
+    exit 0
+    ;;
+  *)
+    echo "Usage: $0 [--native-only]" >&2
+    exit 2
+    ;;
+esac
+if (( $# > 1 )); then
+  echo "Usage: $0 [--native-only]" >&2
+  exit 2
+fi
+
 workspace="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 vendor="$workspace/vendor"
 ros_setup="/opt/ros/humble/setup.bash"
@@ -8,15 +26,22 @@ algorithm_build="$workspace/build_algorithms"
 prefix="$workspace/external"
 jobs="${JOBS:-4}"
 
-if [[ ! -f "$ros_setup" ]]; then
+if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+  echo "JOBS must be a positive integer: $jobs" >&2
+  exit 2
+fi
+
+if [[ "$native_only" == false && ! -f "$ros_setup" ]]; then
   echo "ROS 2 setup file not found: $ros_setup" >&2
   exit 1
 fi
 
 unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH LD_LIBRARY_PATH PYTHONPATH
-set +u
-source "$ros_setup"
-set -u
+if [[ "$native_only" == false ]]; then
+  set +u
+  source "$ros_setup"
+  set -u
+fi
 
 cmake -S "$vendor/robin" -B "$algorithm_build/robin" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -49,6 +74,10 @@ cmake -S "$vendor/small_gicp" -B "$algorithm_build/small_gicp" \
   -DBUILD_WITH_MARCH_NATIVE=OFF
 cmake --build "$algorithm_build/small_gicp" --parallel "$jobs"
 cmake --install "$algorithm_build/small_gicp"
+
+if [[ "$native_only" == true ]]; then
+  exit 0
+fi
 
 cd "$workspace"
 export CMAKE_PREFIX_PATH="$prefix:${CMAKE_PREFIX_PATH:-}"

@@ -41,6 +41,9 @@ patch -p1 -i src/localization/deployment/robin-local-sources.patch
 构建脚本先清除可能继承的旧工作空间 ROS/CMake 环境，再加载
 `/opt/ros/humble`。它依次从源码构建 ROBIN、KISS Matcher、small_gicp，
 安装到 `external/`，最后构建四个 ROS 2 包。
+从 Nav3 主工作空间统一构建 ROS 包时，可在定位工作空间执行
+`bash src/localization/deployment/build_from_source.sh --native-only`，只准备
+上述三个算法库，不运行子模块内的 `colcon`，也不创建安装地图软链接。
 将工作空间改名或移动后，先删除旧的 `build/`、`build_algorithms/`、
 `install/` 和 `external/` 生成目录，再运行本脚本。旧 CMake 缓存与
 ROS 安装脚本中的绝对路径不会自动更新。

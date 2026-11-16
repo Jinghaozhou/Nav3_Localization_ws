@@ -16,6 +16,7 @@ find_package(ament_cmake REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -63,7 +64,7 @@ add_executable(navigation_localizer
 )
 target_include_directories(navigation_localizer PRIVATE include ${PCL_INCLUDE_DIRS})
 ament_target_dependencies(navigation_localizer
-  rclcpp sensor_msgs geometry_msgs tf2 tf2_ros pcl_conversions)
+  rclcpp sensor_msgs std_msgs geometry_msgs tf2 tf2_ros pcl_conversions)
 target_link_libraries(navigation_localizer
   OpenSSL::Crypto
   yaml-cpp

@@ -27,6 +27,7 @@
 | `/localization/selected_cloud` | `sensor_msgs/msg/PointCloud2` | 启用关键帧功能后，发布实际选用的原始点云 |
 | `/localization/input_snapshot` | `kiss_matcher_localization/msg/LocalizationInput` | 开启 `record_inputs` 且有订阅者时，记录尝试编号、阶段、原话题、选择时间及原始点云 |
 | `/localization/status` | `kiss_matcher_localization/msg/LocalizationResult` | 每次尝试／确认后发布；reliable + transient-local |
+| `/localization/navigation_allowed` | `std_msgs/msg/Bool` | 定位模块每 200 ms 发布一次导航许可；reliable + volatile。首次应用前为 false。 |
 
 `KeyframeCandidates` 必须和当前地图、关键帧库、配置的 SHA-256 匹配；
 候选个数、ID、时间窗口和位姿也会检查。检索器位于外部
@@ -64,6 +65,16 @@ ros2 service call /localization/accept_candidate \
 `inliers` 是历史 KISS 粗配准内点字段，连续定位中为 0；
 使用 `overlap_percent`、`registration_ms`、时间戳和 `candidate_id`
 监控当前行为。
+
+导航许可要求：已成功应用全局定位；最近一次应用未超过
+`navigation_permission.max_success_age_sec`（默认 5 秒）；连续未匹配次数小于
+`navigation_permission.max_consecutive_failures`（默认 3）；`odom` 中的非空局部地图
+及 `odom → base_link` TF 分别未超过 2.5 秒和 0.5 秒。局部地图同时按消息时间戳和
+本机接收时间检查。偶发一次匹配失败不会立即撤销许可；超时、输入时间回跳或
+节点停止发布时许可失效。`map → odom` 仍可供诊断查询，不能单独用其新鲜度
+判断定位可靠。SCAN 联调时设置 `require_localization_permission:=true`，并将
+`localization_permission_topic` 指向 `/localization/navigation_allowed`；SCAN 的
+许可订阅超过 1 秒没有更新也会停车。
 
 ## 地图与配置
 

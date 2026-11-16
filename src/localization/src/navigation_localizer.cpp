@@ -24,6 +24,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <tf2/exceptions.h>
 #include <tf2/time.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -100,6 +101,10 @@ class NavigationLocalizer : public rclcpp::Node {
     max_auto_translation_m_ = declare_parameter<double>("max_auto_translation_m", 1.0);
     max_auto_rotation_deg_ = declare_parameter<double>("max_auto_rotation_deg", 15.0);
     candidate_timeout_sec_ = declare_parameter<double>("candidate_timeout_sec", 60.0);
+    permission_max_success_age_sec_ = declare_parameter<double>("navigation_permission.max_success_age_sec", 5.0);
+    permission_max_local_map_age_sec_ = declare_parameter<double>("navigation_permission.max_local_map_age_sec", 2.5);
+    permission_max_odom_age_sec_ = declare_parameter<double>("navigation_permission.max_odom_age_sec", 0.5);
+    permission_max_consecutive_failures_ = declare_parameter<int>("navigation_permission.max_consecutive_failures", 3);
 
     if (map_pcd.empty() || map_frame_.empty() || odom_frame_.empty() ||
         base_frame_.empty() || map_frame_ == odom_frame_ ||
@@ -107,6 +112,10 @@ class NavigationLocalizer : public rclcpp::Node {
         max_local_map_age_sec_ < 0.0 || retry_interval_sec_ <= 0.0 ||
         periodic_interval_sec_ < 0.0 || max_auto_translation_m_ < 0.0 ||
         max_auto_rotation_deg_ < 0.0 || candidate_timeout_sec_ <= 0.0 ||
+        !std::isfinite(permission_max_success_age_sec_) || permission_max_success_age_sec_ <= 0.0 ||
+        !std::isfinite(permission_max_local_map_age_sec_) || permission_max_local_map_age_sec_ <= 0.0 ||
+        !std::isfinite(permission_max_odom_age_sec_) || permission_max_odom_age_sec_ <= 0.0 ||
+        permission_max_consecutive_failures_ < 1 ||
         (local_map_reliability != "best_effort" &&
          local_map_reliability != "reliable")) {
       throw std::invalid_argument("invalid navigation localization parameters");
@@ -259,6 +268,7 @@ class NavigationLocalizer : public rclcpp::Node {
               input_time_reset_=true;latest_global_map_.reset();
             }
             latest_local_map_ = std::move(message);
+            last_local_map_wall_ = Clock::now();
             if (!first_local_map_logged_) {
               first_local_map_logged_ = true;
               first_message = true;
@@ -283,6 +293,8 @@ class NavigationLocalizer : public rclcpp::Node {
     rclcpp::QoS status_qos(1);
     status_qos.reliable().transient_local();
     status_pub_ = create_publisher<Result>("status", status_qos);
+    permission_pub_ = create_publisher<std_msgs::msg::Bool>(
+        "/localization/navigation_allowed", rclcpp::QoS(1).reliable());
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
@@ -329,6 +341,8 @@ class NavigationLocalizer : public rclcpp::Node {
         std::chrono::milliseconds(100), [this]() { triggerAutomatically(); }, registration_group_);
     tf_timer_ = create_wall_timer(
         std::chrono::milliseconds(100), [this]() { publishTf(); }, tf_group_);
+    permission_timer_ = create_wall_timer(
+        std::chrono::milliseconds(200), [this]() { publishNavigationPermission(); }, tf_group_);
   }
 
  private:
@@ -546,6 +560,12 @@ class NavigationLocalizer : public rclcpp::Node {
     }
     // Every completed attempt, including early rejection and service calls, starts the cooldown.
     last_completed_ = Clock::now();
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (result.applied) consecutive_failures_ = 0;
+      else if (!result.matched && consecutive_failures_ < permission_max_consecutive_failures_)
+        ++consecutive_failures_;
+    }
     return result;
   }
 
@@ -823,6 +843,7 @@ class NavigationLocalizer : public rclcpp::Node {
       has_applied_ = true;
       last_success_stamp_ = get_clock()->now();
       last_apply_wall_ = Clock::now();
+      consecutive_failures_ = 0;
       result.last_success_stamp = last_success_stamp_;
     }
     result.applied = true;
@@ -896,6 +917,54 @@ class NavigationLocalizer : public rclcpp::Node {
                                              get_clock()->now()));
   }
 
+  void publishNavigationPermission() {
+    const auto wall_now = Clock::now();
+    const auto ros_now = get_clock()->now();
+    const auto fresh = [&ros_now](const rclcpp::Time &stamp, double limit) {
+      const double age = (ros_now - stamp).seconds();
+      return std::isfinite(age) && age >= 0.0 && age <= limit;
+    };
+    bool applied = false;
+    bool success_fresh = false;
+    bool failures_ok = false;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      applied = has_applied_;
+      success_fresh = last_apply_wall_ &&
+          std::chrono::duration<double>(wall_now - *last_apply_wall_).count() <= permission_max_success_age_sec_ &&
+          fresh(last_success_stamp_, permission_max_success_age_sec_);
+      failures_ok = consecutive_failures_ < permission_max_consecutive_failures_;
+    }
+    bool map_fresh = false;
+    {
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      map_fresh = !input_time_reset_ && latest_local_map_ && last_local_map_wall_ &&
+          latest_local_map_->width > 0 && latest_local_map_->height > 0 &&
+          latest_local_map_->header.frame_id == odom_frame_ &&
+          std::chrono::duration<double>(wall_now - *last_local_map_wall_).count() <= permission_max_local_map_age_sec_ &&
+          fresh(rclcpp::Time(latest_local_map_->header.stamp), permission_max_local_map_age_sec_);
+    }
+    bool odom_fresh = false;
+    if (applied && success_fresh && failures_ok && map_fresh) {
+      try {
+        const auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_, tf2::TimePointZero);
+        odom_fresh = fresh(rclcpp::Time(tf.header.stamp), permission_max_odom_age_sec_);
+      } catch (const tf2::TransformException &) {
+        odom_fresh = false;
+      }
+    }
+    std_msgs::msg::Bool permission;
+    permission.data = applied && success_fresh && failures_ok && map_fresh && odom_fresh;
+    permission_pub_->publish(permission);
+    if (!last_permission_ || *last_permission_ != permission.data) {
+      RCLCPP_INFO(get_logger(), "Navigation permission %s: applied=%s success_fresh=%s failures_ok=%s map_fresh=%s odom_fresh=%s",
+          permission.data ? "GRANTED" : "DENIED", applied ? "true" : "false",
+          success_fresh ? "true" : "false", failures_ok ? "true" : "false",
+          map_fresh ? "true" : "false", odom_fresh ? "true" : "false");
+      last_permission_ = permission.data;
+    }
+  }
+
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -906,6 +975,12 @@ class NavigationLocalizer : public rclcpp::Node {
   double max_auto_translation_m_ = 1.0;
   double max_auto_rotation_deg_ = 15.0;
   double candidate_timeout_sec_ = 60.0;
+  double permission_max_success_age_sec_ = 5.0;
+  double permission_max_local_map_age_sec_ = 2.5;
+  double permission_max_odom_age_sec_ = 0.5;
+  int permission_max_consecutive_failures_ = 3;
+  int consecutive_failures_ = 0;  // guarded by state_mutex_
+  std::optional<bool> last_permission_;
 
   bool multistart_enabled_ = false, initialization_tf_valid_ = false;
   bool input_time_reset_ = false;  // guarded by input_mutex_
@@ -946,6 +1021,7 @@ class NavigationLocalizer : public rclcpp::Node {
   std::mutex input_mutex_;
   bool first_local_map_logged_ = false;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_local_map_;
+  std::optional<Clock::time_point> last_local_map_wall_;  // guarded by input_mutex_
   std::mutex state_mutex_;
   bool has_applied_ = false;
   Eigen::Matrix4d applied_map_T_odom_ = Eigen::Matrix4d::Identity();
@@ -967,11 +1043,13 @@ class NavigationLocalizer : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr tf_group_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr local_map_sub_;
   rclcpp::Publisher<Result>::SharedPtr status_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr permission_pub_;
   rclcpp::Service<Relocalize>::SharedPtr relocalize_service_;
   rclcpp::Service<SetRegion>::SharedPtr region_service_;
   rclcpp::Service<AcceptCandidate>::SharedPtr accept_service_;
   rclcpp::TimerBase::SharedPtr trigger_timer_;
   rclcpp::TimerBase::SharedPtr tf_timer_;
+  rclcpp::TimerBase::SharedPtr permission_timer_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;

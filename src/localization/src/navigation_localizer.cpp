@@ -360,6 +360,7 @@ class NavigationLocalizer : public rclcpp::Node {
   void setRegionHint(const std::string &hint) {
     const int id = region_map_.resolveHint(hint);  // Validate before changing current state.
     active_region_id_ = id;
+    last_bbs_query_stamp_=0;
     if (initializer_) initializer_->reset();
     recovering_candidates_=false;initialization_reference_ns_=0;
     force_global_next_ = true;
@@ -580,7 +581,7 @@ class NavigationLocalizer : public rclcpp::Node {
       bool reset=false;
       {std::lock_guard<std::mutex> lock(input_mutex_);reset=input_time_reset_;input_time_reset_=false;}
       if(reset) {
-        initializer_->reset();initialization_reference_ns_=0;
+        initializer_->reset();initialization_reference_ns_=0;last_bbs_query_stamp_=0;
         std::lock_guard<std::mutex> lock(state_mutex_);
         has_applied_=false;recovering_candidates_=false;last_apply_wall_.reset();applied_map_T_odom_.setIdentity();
         force_global_next_=true;
@@ -617,7 +618,18 @@ class NavigationLocalizer : public rclcpp::Node {
     keyframe_attempt_=false;keyframe_guesses_.clear();
     if(keyframes_enabled_ && !try_prior && (active_region_id_==keyframe_region_id_ || (active_region_id_<0 && recovering_candidates_))) {
       Keyframes::ConstSharedPtr m;{std::lock_guard<std::mutex> lock(input_mutex_);m=latest_keyframes_;}
-      if(!m || !m->ready) {result.reason="keyframe_query_unavailable";initializer_->resetConfirmation();return result;}
+      if(!m || !m->ready) {
+        result.reason="keyframe_query_unavailable";
+        const std::set<std::string> temporary={"no_short_cloud","short_cloud_warmup","query_odom_missing","estimated_gravity_missing_at_query_stamp","bbs_search_pending"};
+        if(m && m->region_id==keyframe_region_id_ && m->map_sha256==keyframe_map_sha_ &&
+            m->library_sha256==keyframe_library_sha_ && m->profile_sha256==keyframe_profile_sha_ &&
+            m->cloud.header.frame_id==odom_frame_ && temporary.count(m->reason)) {
+          initialization_decision_.confirmations=initializer_->waitForQuery(get_clock()->now().nanoseconds());
+          initialization_decision_.reason="initialization_wait_query";
+          RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,"INIT_WAIT query=%s confirmations=%d; no new match, time limit still enforced",m->reason.c_str(),initialization_decision_.confirmations);
+        } else initializer_->resetConfirmation();
+        return result;
+      }
       if(m->map_sha256!=keyframe_map_sha_ || m->library_sha256!=keyframe_library_sha_ || m->profile_sha256!=keyframe_profile_sha_ || m->region_id!=keyframe_region_id_) {
         result.reason="keyframe_version_or_region_mismatch";initializer_->resetConfirmation();return result;
       }
@@ -657,6 +669,17 @@ class NavigationLocalizer : public rclcpp::Node {
       return result;
     }
 
+    if(keyframe_attempt_ && candidate_source_=="bbs") {
+      const auto stamp=rclcpp::Time(snapshot->header.stamp).nanoseconds();
+      if(last_bbs_query_stamp_ && stamp<=last_bbs_query_stamp_) {
+        result.reason=stamp==last_bbs_query_stamp_ ? "keyframe_query_already_processed" : "bbs_query_out_of_order";
+        if(stamp==last_bbs_query_stamp_) {
+          initialization_decision_.confirmations=initializer_->waitForQuery(get_clock()->now().nanoseconds());
+          initialization_decision_.reason="initialization_wait_query";
+        } else initializer_->resetConfirmation();
+        return result;
+      }
+    }
     force_global_next_ = false;
     try {
       captureInput(*snapshot, keyframe_attempt_ ? "keyframe" : (try_prior ? "prior" : "global"), snapshot_topic);
@@ -692,6 +715,7 @@ class NavigationLocalizer : public rclcpp::Node {
         result.registration_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
         diagnostics_=registration;result.overlap_percent=registration.overlap_percent;
         result.reason="prior_registration_rejected";pending_.reset();
+        if(candidate_source_=="bbs") last_bbs_query_stamp_=rclcpp::Time(snapshot->header.stamp).nanoseconds();
         if(keyframes_enabled_){recovering_candidates_=true;force_global_next_=true;initializer_->reset();initialization_reference_ns_=0;}
         RCLCPP_WARN(get_logger(),"Prior VGICP rejected; no coarse fallback. Next fresh input uses %s",keyframes_enabled_?"database candidates with two-window confirmation":"prior VGICP until expiry; then explicit reinitialization required");
         return result;
@@ -710,6 +734,7 @@ class NavigationLocalizer : public rclcpp::Node {
             return result;
           }
         }
+        if(keyframe_attempt_ && candidate_source_=="bbs") last_bbs_query_stamp_=initialization_stamp_;
         registration = alignInitialized(sampled);
         RCLCPP_INFO(get_logger(), "Registration mode: %s", attempt_mode_.c_str());
       } else {
@@ -935,6 +960,7 @@ class NavigationLocalizer : public rclcpp::Node {
   kiss_matcher::RegionMap region_map_;
   std::string region_labels_csv_;
   std::string candidate_source_;
+  std::int64_t last_bbs_query_stamp_=0;
   bool keyframes_enabled_=false,keyframe_attempt_=false;
   std::string keyframe_map_sha_,keyframe_library_sha_,keyframe_profile_sha_;
   int keyframe_region_id_=2,keyframe_expected_=28;

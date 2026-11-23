@@ -1,6 +1,7 @@
 // Offline state-machine tests: no rclcpp initialization, nodes, TF or ROS traffic.
 #include "localization/region_initializer.h"
 #include <iostream>
+#include <filesystem>
 #include <stdexcept>
 using namespace kiss_matcher;
 namespace {
@@ -91,6 +92,18 @@ int main(int argc,char **argv) {
   // A TF lookup failure is a node concern. Its handler calls this exact reset.
   gate.reset();gate.begin(1,61*sec,odom);list={candidate(map_T_odom,odom)};d=gate.decide(list,61*sec,odom);
   check(!d.ready && d.confirmations==1,"external TF-failure reset discards confirmation history");
+  if (std::filesystem::exists(std::filesystem::path(argv[1]).parent_path()/"region_initialization.dynamic.example.yaml")) {
+    RegionInitializer dynamic(config);
+    dynamic.load((std::filesystem::path(argv[1]).parent_path()/"region_initialization.dynamic.example.yaml").string(),"map","base_link");
+    dynamic.begin(10,100*sec,odom);
+    check(dynamic.guesses().empty(),"dynamic profiles must not invent fixed seeds");
+    std::vector<InitializationCandidate> external={dynamic.evaluate("bbs_peak_0","bbs_vgicp",result(map_T_odom),odom,map_T_odom,false)};
+    auto first=dynamic.decide(external,100*sec,odom);
+    check(!first.ready && first.confirmations==1,"dynamic region still requires first confirmation");
+    dynamic.begin(10,102*sec,odom);
+    auto second=dynamic.decide(external,102*sec,odom);
+    check(second.ready && second.confirmations==2,"dynamic region accepts consistent second window");
+  }
   if (argc==3) {
     RegionInitializer anchor(config);anchor.load(argv[2],"map","base_link");
     anchor.begin(1,100*sec,odom);

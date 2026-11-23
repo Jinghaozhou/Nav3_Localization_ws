@@ -190,12 +190,13 @@ class NavigationLocalizer : public rclcpp::Node {
       RCLCPP_WARN(get_logger(), "REGION_INIT enabled profile=%s confirmations=%d; exact snapshot TF required", seed_file.c_str(), init.confirm_windows);
     }
     candidate_source_=declare_parameter<std::string>("candidate_source","keyframes");
-    if(candidate_source_!="keyframes" && candidate_source_!="bbs") throw std::invalid_argument("Unsupported candidate source");
+    if(candidate_source_!="keyframes" && candidate_source_!="bbs" && candidate_source_!="virtual") throw std::invalid_argument("Unsupported candidate source");
     keyframes_enabled_=declare_parameter<bool>("keyframe_initialization_enabled",false);
-    if(candidate_source_=="bbs" && !keyframes_enabled_) throw std::invalid_argument("BBS requires candidate packet validation");
+    if(candidate_source_!="keyframes" && !keyframes_enabled_) throw std::invalid_argument("Dynamic sources require candidate packet validation");
     hierarchy_enabled_=declare_parameter<bool>("hierarchical_initialization_enabled",false);
     hierarchy_confidence_=declare_parameter<double>("hierarchical_min_initial_overlap",80.0);
     if(!std::isfinite(hierarchy_confidence_) || hierarchy_confidence_<60 || hierarchy_confidence_>100)throw std::invalid_argument("invalid hierarchical confidence overlap");
+    if(candidate_source_=="virtual" && !hierarchy_enabled_) throw std::invalid_argument("Virtual shortlist requires hierarchical competitor screening");
     if(candidate_source_=="bbs" && hierarchy_enabled_) throw std::invalid_argument("BBS competitors must all be refined; hierarchical screening is not allowed");
     if(hierarchy_enabled_ && !keyframes_enabled_) throw std::invalid_argument("Hierarchical trial requires keyframe candidate packet validation");
     keyframe_region_id_=declare_parameter<int>("keyframe_region_id",2);
@@ -208,6 +209,8 @@ class NavigationLocalizer : public rclcpp::Node {
       keyframe_map_sha_=fileSha256(map_pcd);
       if(candidate_source_=="bbs")
         RCLCPP_WARN(get_logger(),"BBS_INIT experimental, dynamic competing map-search peaks; no fixed entrance or keyframe position lookup; all retained peaks require VGICP/ambiguity/two windows");
+      else if(candidate_source_=="virtual")
+        RCLCPP_WARN(get_logger(),"VIRTUAL_INIT: map-raycast templates, NOT measured references; descriptor shortlist is not exhaustive global search; field acceptance pending");
       else
         RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
     }
@@ -458,7 +461,7 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   kiss_matcher::LocalizationResult alignInitialized(const pcl::PointCloud<Point> &source) {
-    attempt_mode_ = keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_multistart" : "keyframe_multistart") : "region_multistart";
+    attempt_mode_ = keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_multistart" : (candidate_source_=="virtual" ? "virtual_hierarchical" : "keyframe_multistart")) : "region_multistart";
     attempt_region_id_=active_region_id_;
     const auto started=Clock::now();
     const pcl::PointCloud<Point> *target=map_cloud_.get();
@@ -472,7 +475,7 @@ class NavigationLocalizer : public rclcpp::Node {
     bool hierarchy_blocked=false;std::string hierarchy_reason;
     const auto &guesses=keyframe_attempt_ ? keyframe_guesses_ : initializer_->guesses();
     if(keyframe_attempt_ && hierarchy_enabled_) {
-      attempt_mode_="keyframe_hierarchical";
+      attempt_mode_=candidate_source_=="virtual" ? "virtual_hierarchical" : "keyframe_hierarchical";
       auto search=kiss_matcher::hierarchicalSearch(source,*target,guesses,initialization_odom_,initialization_stamp_,*initializer_,*screening_,*registration_,hierarchy_confidence_);
       candidates=std::move(search.candidates);seed_candidates_=search.refined;hierarchy_blocked=search.unresolved_support || search.low_confidence;hierarchy_reason=search.unresolved_support?"hierarchy_unresolved_competitor":"hierarchy_low_confidence";
       RCLCPP_INFO(get_logger(),"HIERARCHY groups=%zu screened=%zu fine=%zu expanded=%s input_candidates=%zu; screen scores are ranking only",search.groups,search.screened,search.refined,search.expanded?"true":"false",guesses.size());
@@ -485,7 +488,7 @@ class NavigationLocalizer : public rclcpp::Node {
     }
     initialization_decision_=initializer_->decide(candidates,initialization_stamp_,initialization_odom_);
     if(hierarchy_blocked){initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=hierarchy_reason;}
-    if(keyframe_attempt_ && (hierarchy_enabled_ || candidate_source_=="bbs") && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
+    if(keyframe_attempt_ && (hierarchy_enabled_ || candidate_source_!="keyframes") && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
       initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=candidate_source_=="bbs" ? "bbs_low_confidence" : "hierarchy_low_confidence";
     }
     initialization_selected_seed_.clear();
@@ -749,7 +752,7 @@ class NavigationLocalizer : public rclcpp::Node {
       if(m->map_sha256!=keyframe_map_sha_ || m->library_sha256!=keyframe_library_sha_ || m->profile_sha256!=keyframe_profile_sha_ || m->region_id!=keyframe_region_id_) {
         result.reason="keyframe_version_or_region_mismatch";initializer_->resetConfirmation();return result;
       }
-      if((candidate_source_=="bbs" ? (m->map_to_odom.empty() || m->map_to_odom.size()>static_cast<std::size_t>(keyframe_expected_) || m->reason!="bbs_competitors_complete") : m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_)) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
+      if((candidate_source_!="keyframes" ? (m->map_to_odom.empty() || m->map_to_odom.size()>static_cast<std::size_t>(keyframe_expected_) || m->reason!=(candidate_source_=="bbs" ? "bbs_competitors_complete" : "virtual_shortlist")) : m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_)) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9<0.8 ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9>1.05 || m->ids.size()!=m->map_to_odom.size() || m->scores.size()!=m->ids.size()) {
         result.reason="keyframe_candidate_shape_invalid";initializer_->resetConfirmation();return result;
@@ -785,7 +788,7 @@ class NavigationLocalizer : public rclcpp::Node {
       return result;
     }
 
-    if(keyframe_attempt_ && candidate_source_=="bbs") {
+    if(keyframe_attempt_ && candidate_source_!="keyframes") {
       const auto stamp=rclcpp::Time(snapshot->header.stamp).nanoseconds();
       if(last_bbs_query_stamp_ && stamp<=last_bbs_query_stamp_) {
         result.reason=stamp==last_bbs_query_stamp_ ? "keyframe_query_already_processed" : "bbs_query_out_of_order";
@@ -832,7 +835,7 @@ class NavigationLocalizer : public rclcpp::Node {
         diagnostics_=registration;result.overlap_percent=registration.overlap_percent;
         result.reason="prior_registration_rejected";pending_.reset();
         if(external_initialization_){force_global_next_=true;openRace();}
-        if(candidate_source_=="bbs") last_bbs_query_stamp_=rclcpp::Time(snapshot->header.stamp).nanoseconds();
+        if(candidate_source_!="keyframes") last_bbs_query_stamp_=rclcpp::Time(snapshot->header.stamp).nanoseconds();
         if(keyframes_enabled_){recovering_candidates_=true;force_global_next_=true;initializer_->reset();initialization_reference_ns_=0;}
         RCLCPP_WARN(get_logger(),"Prior VGICP rejected; no coarse fallback. Next fresh input uses %s",external_initialization_?"BBS + keyframes race with independent two-window confirmation":(keyframes_enabled_?"database candidates with two-window confirmation":"prior VGICP until expiry; then explicit reinitialization required"));
         return result;
@@ -851,7 +854,7 @@ class NavigationLocalizer : public rclcpp::Node {
             return result;
           }
         }
-        if(keyframe_attempt_ && candidate_source_=="bbs") last_bbs_query_stamp_=initialization_stamp_;
+        if(keyframe_attempt_ && candidate_source_!="keyframes") last_bbs_query_stamp_=initialization_stamp_;
         registration = alignInitialized(sampled);
         RCLCPP_INFO(get_logger(), "Registration mode: %s", attempt_mode_.c_str());
       } else {

@@ -38,6 +38,8 @@ class RegionInitializer {
   void reset();
   // Expired registration invalidates confirmation, not the starting-location prior.
   void resetConfirmation();
+  // A temporary missing query is not a contradictory pose. Still expire by time.
+  int waitForQuery(std::int64_t now);
   // Freeze ALL seed map->odom guesses at the first snapshot. Subsequent snapshots
   // use those same transforms, i.e. propagate map->base with relative odometry.
   void begin(int region, std::int64_t stamp, const Eigen::Matrix4d &odom_T_base);

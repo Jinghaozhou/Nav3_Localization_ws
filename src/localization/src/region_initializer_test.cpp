@@ -33,6 +33,7 @@ int main(int argc,char **argv) {
   std::vector<InitializationCandidate> list={candidate(map_T_odom,odom),candidate(map_T_odom,odom,94)};
   auto d=gate.decide(list,10*sec,odom);
   check(d.clusters==1 && !d.ready && d.confirmations==1,"same mode seeds merge and wait");
+  check(gate.waitForQuery(11*sec)==1,"temporary query wait preserves first confirmation");
   d=gate.decide(list,10*sec,odom);
   check(!d.ready && d.confirmations==1,"repeated stamp cannot confirm");
   const auto moving_odom=odom*pose(0.8,0.1,0,0,0,0.08);
@@ -40,6 +41,14 @@ int main(int argc,char **argv) {
   check((gate.guesses()[0].second-map_T_odom).norm()<1e-10,"moving window must keep first odom reference");
   list={candidate(map_T_odom,moving_odom)};d=gate.decide(list,12*sec,moving_odom);
   check(d.ready && d.confirmations==2,"moving second window confirms same map->odom");
+
+  gate.resetConfirmation();gate.begin(1,13*sec,odom);
+  list={candidate(map_T_odom,odom)};d=gate.decide(list,13*sec,odom);
+  check(d.confirmations==1,"fresh first window before wait timeout");
+  check(gate.waitForQuery(24*sec)==0,"waiting must expire confirmation after timeout");
+  gate.begin(1,25*sec,odom);d=gate.decide(list,25*sec,odom);
+  check(d.confirmations==1 && !d.ready,"expired wait cannot confirm with only one new window");
+  check(gate.waitForQuery(24*sec)==0,"backward clock during wait clears confirmation");
 
   gate.reset();gate.begin(1,20*sec,odom);
   list={candidate(map_T_odom,odom),candidate(pose(10)*map_T_odom,odom,93)};

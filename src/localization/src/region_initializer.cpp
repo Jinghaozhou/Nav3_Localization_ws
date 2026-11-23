@@ -88,6 +88,11 @@ void RegionInitializer::reset() {
 void RegionInitializer::resetConfirmation() {
   confirmations_=0; confirmation_stamp_=0; previous_.reset();
 }
+int RegionInitializer::waitForQuery(std::int64_t now) {
+  if(previous_ && (now<confirmation_stamp_ ||
+      (now-confirmation_stamp_)/1e9>config_.confirm_timeout)) resetConfirmation();
+  return confirmations_;
+}
 void RegionInitializer::begin(int region, std::int64_t stamp, const Eigen::Matrix4d &odom_T_base) {
   if (stamp<=0 || !rigid(odom_T_base)) throw std::invalid_argument("invalid snapshot timestamp/odom transform");
   if (active_region_!=region || (last_seen_stamp_ && stamp<last_seen_stamp_)) reset();

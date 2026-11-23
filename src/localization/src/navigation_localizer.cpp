@@ -51,6 +51,10 @@ using Relocalize = kiss_matcher_localization::srv::Relocalize;
 using AcceptCandidate = kiss_matcher_localization::srv::AcceptCandidate;
 using SetRegion = kiss_matcher_localization::srv::SetRegion;
 
+std::int64_t steadyNs(const Clock::time_point &point) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count();
+}
+
 std::string fileSha256(const std::string &path) {
   std::ifstream in(path,std::ios::binary);if(!in) throw std::runtime_error("Cannot hash map");
   auto *ctx=EVP_MD_CTX_new();if(!ctx) throw std::runtime_error("Digest allocation");
@@ -108,6 +112,17 @@ class NavigationLocalizer : public rclcpp::Node {
     permission_max_local_map_age_sec_ = declare_parameter<double>("navigation_permission.max_local_map_age_sec", 2.5);
     permission_max_odom_age_sec_ = declare_parameter<double>("navigation_permission.max_odom_age_sec", 0.5);
     permission_max_consecutive_failures_ = declare_parameter<int>("navigation_permission.max_consecutive_failures", 3);
+    const auto timing_csv = declare_parameter<std::string>("timing_diagnostics_csv", "");
+    if (!timing_csv.empty()) {
+      const std::filesystem::path path(timing_csv);
+      if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+      if (std::filesystem::exists(path)) throw std::runtime_error("timing_diagnostics_csv already exists");
+      timing_csv_.open(path);
+      if (!timing_csv_) throw std::runtime_error("cannot open timing_diagnostics_csv: " + timing_csv);
+      timing_csv_ << "event,steady_ns,ros_ns,map_stamp_ns,points,map_receive_steady_ns,"
+                     "map_receive_ros_ns,tf_stamp_ns,applied,success_fresh,failures_ok,map_fresh,odom_fresh\n";
+      RCLCPP_INFO(get_logger(), "Localization timing CSV: %s", timing_csv.c_str());
+    }
     if (map_pcd.empty() || map_frame_.empty() || odom_frame_.empty() ||
         base_frame_.empty() || map_frame_ == odom_frame_ ||
         odom_frame_ == base_frame_ || voxel_resolution_ <= 0.0 ||
@@ -282,6 +297,9 @@ class NavigationLocalizer : public rclcpp::Node {
     local_map_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         local_map_topic, input_qos,
         [this, local_map_topic](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+          const auto receive_wall = Clock::now();
+          const auto receive_ros_ns = get_clock()->now().nanoseconds();
+          const auto map_stamp_ns = rclcpp::Time(message->header.stamp).nanoseconds();
           const auto points = static_cast<std::size_t>(message->width) * message->height;
           const auto frame = message->header.frame_id;
           bool first_message = false;
@@ -292,11 +310,18 @@ class NavigationLocalizer : public rclcpp::Node {
               input_time_reset_=true;latest_global_map_.reset();
             }
             latest_local_map_ = std::move(message);
-            last_local_map_wall_ = Clock::now();
+            last_local_map_wall_ = receive_wall;
+            last_local_map_receive_ros_ns_ = receive_ros_ns;
             if (!first_local_map_logged_) {
               first_local_map_logged_ = true;
               first_message = true;
             }
+          }
+          if (timing_csv_) {
+            std::lock_guard<std::mutex> lock(timing_csv_mutex_);
+            timing_csv_ << "receive," << steadyNs(receive_wall) << ',' << receive_ros_ns << ','
+                        << map_stamp_ns << ',' << points << ',' << steadyNs(receive_wall)
+                        << ',' << receive_ros_ns << ",-1,,,,,\n" << std::flush;
           }
           if (first_message) {
             RCLCPP_INFO(get_logger(),
@@ -1074,8 +1099,20 @@ class NavigationLocalizer : public rclcpp::Node {
       failures_ok = consecutive_failures_ < permission_max_consecutive_failures_;
     }
     bool map_fresh = false;
+    std::int64_t map_stamp_ns = -1;
+    std::int64_t map_receive_steady_ns = -1;
+    std::int64_t map_receive_ros_ns = -1;
+    std::size_t map_points = 0;
     {
       std::lock_guard<std::mutex> lock(input_mutex_);
+      if (timing_csv_) {
+        if (latest_local_map_) {
+          map_stamp_ns = rclcpp::Time(latest_local_map_->header.stamp).nanoseconds();
+          map_points = static_cast<std::size_t>(latest_local_map_->width) * latest_local_map_->height;
+        }
+        if (last_local_map_wall_) map_receive_steady_ns = steadyNs(*last_local_map_wall_);
+        map_receive_ros_ns = last_local_map_receive_ros_ns_;
+      }
       map_fresh = !input_time_reset_ && latest_local_map_ && last_local_map_wall_ &&
           latest_local_map_->width > 0 && latest_local_map_->height > 0 &&
           latest_local_map_->header.frame_id == odom_frame_ &&
@@ -1083,10 +1120,13 @@ class NavigationLocalizer : public rclcpp::Node {
           fresh(rclcpp::Time(latest_local_map_->header.stamp), permission_max_local_map_age_sec_);
     }
     bool odom_fresh = false;
-    if (applied && success_fresh && failures_ok && map_fresh) {
+    std::int64_t tf_stamp_ns = -1;
+    const bool check_odom = applied && success_fresh && failures_ok && map_fresh;
+    if (check_odom || timing_csv_) {
       try {
         const auto tf = tf_buffer_->lookupTransform(odom_frame_, base_frame_, tf2::TimePointZero);
-        odom_fresh = fresh(rclcpp::Time(tf.header.stamp), permission_max_odom_age_sec_);
+        tf_stamp_ns = rclcpp::Time(tf.header.stamp).nanoseconds();
+        if (check_odom) odom_fresh = fresh(rclcpp::Time(tf.header.stamp), permission_max_odom_age_sec_);
       } catch (const tf2::TransformException &) {
         odom_fresh = false;
       }
@@ -1094,6 +1134,14 @@ class NavigationLocalizer : public rclcpp::Node {
     std_msgs::msg::Bool permission;
     permission.data = applied && success_fresh && failures_ok && map_fresh && odom_fresh;
     permission_pub_->publish(permission);
+    if (timing_csv_) {
+      std::lock_guard<std::mutex> lock(timing_csv_mutex_);
+      timing_csv_ << "permission," << steadyNs(wall_now) << ',' << ros_now.nanoseconds()
+                  << ',' << map_stamp_ns << ',' << map_points << ',' << map_receive_steady_ns
+                  << ',' << map_receive_ros_ns << ',' << tf_stamp_ns << ','
+                  << applied << ',' << success_fresh << ',' << failures_ok << ','
+                  << map_fresh << ',' << odom_fresh << '\n' << std::flush;
+    }
     if (!last_permission_ || *last_permission_ != permission.data) {
       RCLCPP_INFO(get_logger(), "Navigation permission %s: applied=%s success_fresh=%s failures_ok=%s map_fresh=%s odom_fresh=%s",
           permission.data ? "GRANTED" : "DENIED", applied ? "true" : "false",
@@ -1142,6 +1190,9 @@ class NavigationLocalizer : public rclcpp::Node {
   double prior_max_age_ = 30.0;
   std::string global_topic_;
   std::optional<Clock::time_point> last_apply_wall_;
+  std::int64_t last_local_map_receive_ros_ns_ = -1;  // guarded by input_mutex_
+  std::ofstream timing_csv_;
+  std::mutex timing_csv_mutex_;
   sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_global_map_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_sub_;
   pcl::PointCloud<Point>::Ptr map_cloud_;

@@ -20,6 +20,7 @@ launch:
   - arg: {name: base_frame, default: "base_link"}
   - arg: {name: config_path, default: $(find-pkg-share kiss_matcher_localization)/config/navigation_localization.yaml}
   - arg: {name: metrics_csv, default: "", description: "Optional per-attempt diagnostics CSV"}
+  - arg: {name: timing_diagnostics_csv, default: "", description: "Optional local-map receipt and permission timing CSV"}
   - arg: {name: record_inputs, default: "false", description: "Publish exact input snapshots for rosbag"}
   - arg: {name: external_initialization_enabled, default: "false"}
   - arg: {name: race_bbs_sha256, default: ""}
@@ -43,6 +44,7 @@ launch:
         - {name: map_cache_directory, value: $(var map_cache_directory), type: str}
         - from: $(var config_path)
         - {name: metrics_csv, value: $(var metrics_csv)}
+        - {name: timing_diagnostics_csv, value: $(var timing_diagnostics_csv)}
         - {name: publish_attempt_inputs, value: $(var record_inputs)}
         - {name: map_pcd, value: $(var map_pcd)}
         - {name: region_labels_csv, value: $(var region_labels_csv)}

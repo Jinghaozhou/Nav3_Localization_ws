@@ -18,6 +18,8 @@ struct MapRegion {
 class RegionMap {
  public:
   void load(const std::string &pcd, const std::string &labels_csv, double voxel);
+  void saveCache(const std::string &directory) const;
+  void loadCache(const std::string &directory, const std::string &labels_csv);
   int resolveHint(const std::string &hint) const;  // -1 explicitly clears the hint.
   const MapRegion &region(int id) const;
   const std::map<int, MapRegion> &regions() const { return regions_; }

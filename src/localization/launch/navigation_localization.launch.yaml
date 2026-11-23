@@ -21,6 +21,12 @@ launch:
   - arg: {name: config_path, default: $(find-pkg-share kiss_matcher_localization)/config/navigation_localization.yaml}
   - arg: {name: metrics_csv, default: "", description: "Optional per-attempt diagnostics CSV"}
   - arg: {name: record_inputs, default: "false", description: "Publish exact input snapshots for rosbag"}
+  - arg: {name: external_initialization_enabled, default: "false"}
+  - arg: {name: race_bbs_sha256, default: ""}
+  - arg: {name: race_keyframes_sha256, default: ""}
+  - arg: {name: race_profile_sha256, default: ""}
+  - arg: {name: race_bbs_profile_sha256, default: ""}
+  - arg: {name: map_cache_directory, default: ""}
   - node:
       pkg: kiss_matcher_localization
       exec: navigation_localizer
@@ -29,6 +35,12 @@ launch:
       output: screen
       on_exit: shutdown
       param:
+        - {name: external_initialization_enabled, value: $(var external_initialization_enabled), type: bool}
+        - {name: race_bbs_sha256, value: $(var race_bbs_sha256), type: str}
+        - {name: race_keyframes_sha256, value: $(var race_keyframes_sha256), type: str}
+        - {name: race_profile_sha256, value: $(var race_profile_sha256), type: str}
+        - {name: race_bbs_profile_sha256, value: $(var race_bbs_profile_sha256), type: str}
+        - {name: map_cache_directory, value: $(var map_cache_directory), type: str}
         - from: $(var config_path)
         - {name: metrics_csv, value: $(var metrics_csv)}
         - {name: publish_attempt_inputs, value: $(var record_inputs)}

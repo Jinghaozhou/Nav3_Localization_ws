@@ -16,6 +16,7 @@ find_package(ament_cmake REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -30,6 +31,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/KeyframeCandidates.msg"
   "srv/Relocalize.srv"
   "srv/AcceptCandidate.srv"
+  "srv/RaceInitialization.srv"
   "srv/SetRegion.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs sensor_msgs
 )
@@ -63,7 +65,7 @@ add_executable(navigation_localizer
 )
 target_include_directories(navigation_localizer PRIVATE include ${PCL_INCLUDE_DIRS})
 ament_target_dependencies(navigation_localizer
-  rclcpp sensor_msgs geometry_msgs tf2 tf2_ros pcl_conversions)
+  rclcpp std_msgs sensor_msgs geometry_msgs tf2 tf2_ros pcl_conversions)
 target_link_libraries(navigation_localizer
   OpenSSL::Crypto
   yaml-cpp
@@ -80,6 +82,11 @@ target_include_directories(pcd_pointcloud_publisher PRIVATE include ${PCL_INCLUD
 ament_target_dependencies(pcd_pointcloud_publisher
   rclcpp sensor_msgs pcl_conversions)
 target_link_libraries(pcd_pointcloud_publisher ${PCL_LIBRARIES})
+
+add_executable(prepare_region_map_cache src/prepare_region_map_cache.cpp src/region_map.cpp)
+target_include_directories(prepare_region_map_cache PRIVATE include ${PCL_INCLUDE_DIRS})
+target_link_libraries(prepare_region_map_cache ${PCL_LIBRARIES})
+install(TARGETS prepare_region_map_cache DESTINATION lib/${PROJECT_NAME})
 
 add_executable(region_map_inspect src/region_map_inspect.cpp src/region_map.cpp)
 target_include_directories(region_map_inspect PRIVATE include ${PCL_INCLUDE_DIRS})

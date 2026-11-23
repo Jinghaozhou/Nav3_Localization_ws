@@ -1,0 +1,11 @@
+bool submit
+uint64 epoch
+string source
+string map_sha256
+string library_sha256
+string profile_sha256
+kiss_matcher_localization/LocalizationResult proposal
+---
+uint64 epoch
+bool waiting
+kiss_matcher_localization/LocalizationResult result

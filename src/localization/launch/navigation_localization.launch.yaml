@@ -5,6 +5,7 @@ launch:
   - arg: {name: initial_region, default: "", description: "Current region ID/name/sentence; empty means full map"}
   - arg: {name: hierarchical_min_initial_overlap, default: "80.0"}
   - arg: {name: hierarchical_initialization_enabled, default: "false"}
+  - arg: {name: candidate_source, default: "keyframes"}
   - arg: {name: keyframe_initialization_enabled, default: "false"}
   - arg: {name: keyframe_library_sha256, default: ""}
   - arg: {name: keyframe_profile_sha256, default: ""}
@@ -20,6 +21,12 @@ launch:
   - arg: {name: config_path, default: $(find-pkg-share kiss_matcher_localization)/config/navigation_localization.yaml}
   - arg: {name: metrics_csv, default: "", description: "Optional per-attempt diagnostics CSV"}
   - arg: {name: record_inputs, default: "false", description: "Publish exact input snapshots for rosbag"}
+  - arg: {name: external_initialization_enabled, default: "false"}
+  - arg: {name: race_bbs_sha256, default: ""}
+  - arg: {name: race_keyframes_sha256, default: ""}
+  - arg: {name: race_profile_sha256, default: ""}
+  - arg: {name: race_bbs_profile_sha256, default: ""}
+  - arg: {name: map_cache_directory, default: ""}
   - node:
       pkg: kiss_matcher_localization
       exec: navigation_localizer
@@ -28,6 +35,12 @@ launch:
       output: screen
       on_exit: shutdown
       param:
+        - {name: external_initialization_enabled, value: $(var external_initialization_enabled), type: bool}
+        - {name: race_bbs_sha256, value: $(var race_bbs_sha256), type: str}
+        - {name: race_keyframes_sha256, value: $(var race_keyframes_sha256), type: str}
+        - {name: race_profile_sha256, value: $(var race_profile_sha256), type: str}
+        - {name: race_bbs_profile_sha256, value: $(var race_bbs_profile_sha256), type: str}
+        - {name: map_cache_directory, value: $(var map_cache_directory), type: str}
         - from: $(var config_path)
         - {name: metrics_csv, value: $(var metrics_csv)}
         - {name: publish_attempt_inputs, value: $(var record_inputs)}
@@ -37,6 +50,7 @@ launch:
         - {name: region_multistart_enabled, value: $(var region_multistart_enabled), type: bool}
         - {name: hierarchical_min_initial_overlap, value: $(var hierarchical_min_initial_overlap), type: float}
         - {name: hierarchical_initialization_enabled, value: $(var hierarchical_initialization_enabled), type: bool}
+        - {name: candidate_source, value: $(var candidate_source), type: str}
         - {name: keyframe_initialization_enabled, value: $(var keyframe_initialization_enabled), type: bool}
         - {name: keyframe_library_sha256, value: $(var keyframe_library_sha256), type: str}
         - {name: keyframe_profile_sha256, value: $(var keyframe_profile_sha256), type: str}

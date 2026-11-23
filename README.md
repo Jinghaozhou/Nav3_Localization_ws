@@ -139,3 +139,9 @@ ros2 launch pcd_cloud_publisher local_map_from_pcd.launch.yaml
 候选定位还需要相同时间的 `odom → base_link` TF、适用该点云的候选位姿
 和对应全局地图；单独发布 PCD 不能完成 wyn 的首次定位流程。
 地图 PCD 是本机部署数据，已被 Git 忽略，克隆仓库后须单独提供。
+
+## 2026-11-23 experimental dual-source synchronization
+
+The `wyn/race-auto-library-20261123` integration branch merges the local BBS/keyframe race, asynchronous query waiting, and exact voxel-map caches while retaining the shared navigation-permission freshness/failure gate. Only the authority publishes `map → odom` and `/localization/navigation_allowed`; private validators publish neither. `RaceInitialization.srv` validates epoch, source/map/profile versions, input age, timestamp TF and correction bounds before applying the winning independently confirmed proposal. KISS coarse fallback remains disabled.
+
+The matching Sensor branch supplies `tools/mid360_lidar/scripts/start_scan.sh --mode race --region space_2`, data manifests and versioned automatic-library admission. Standard Nav3 bringup defaults are unchanged; do not launch both sensor entries together. Transfer matching non-Git map/library/BBS data separately. This branch has compile/component and isolated recorded-geometry checks; it does not claim Go2 extrinsic calibration or field navigation acceptance.

@@ -25,6 +25,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/u_int64.hpp>
+#include "kiss_matcher_localization/srv/race_initialization.hpp"
 #include <tf2/exceptions.h>
 #include <tf2/time.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -101,11 +103,11 @@ class NavigationLocalizer : public rclcpp::Node {
     max_auto_translation_m_ = declare_parameter<double>("max_auto_translation_m", 1.0);
     max_auto_rotation_deg_ = declare_parameter<double>("max_auto_rotation_deg", 15.0);
     candidate_timeout_sec_ = declare_parameter<double>("candidate_timeout_sec", 60.0);
+
     permission_max_success_age_sec_ = declare_parameter<double>("navigation_permission.max_success_age_sec", 5.0);
     permission_max_local_map_age_sec_ = declare_parameter<double>("navigation_permission.max_local_map_age_sec", 2.5);
     permission_max_odom_age_sec_ = declare_parameter<double>("navigation_permission.max_odom_age_sec", 0.5);
     permission_max_consecutive_failures_ = declare_parameter<int>("navigation_permission.max_consecutive_failures", 3);
-
     if (map_pcd.empty() || map_frame_.empty() || odom_frame_.empty() ||
         base_frame_.empty() || map_frame_ == odom_frame_ ||
         odom_frame_ == base_frame_ || voxel_resolution_ <= 0.0 ||
@@ -137,6 +139,18 @@ class NavigationLocalizer : public rclcpp::Node {
       throw std::invalid_argument("invalid registration parameters");
     }
 
+    publish_tf_ = declare_parameter<bool>("publish_tf", true);
+    race_validator_ = declare_parameter<bool>("race_validator", false);
+    external_initialization_ = declare_parameter<bool>("external_initialization_enabled", false);
+    race_keyframes_sha_ = declare_parameter<std::string>("race_keyframes_sha256", "");
+    race_bbs_sha_ = declare_parameter<std::string>("race_bbs_sha256", "");
+    race_bbs_profile_sha_ = declare_parameter<std::string>("race_bbs_profile_sha256", "");
+    race_profile_sha_ = declare_parameter<std::string>("race_profile_sha256", "");
+    race_map_sha_ = external_initialization_ ? fileSha256(map_pcd) : "";
+    race_start_ns_ = get_clock()->now().nanoseconds();
+    if (external_initialization_ && (race_validator_ || race_keyframes_sha_.size()!=64 || race_bbs_sha_.size()!=64 || race_profile_sha_.size()!=64 || race_bbs_profile_sha_.size()!=64))
+      throw std::invalid_argument("Invalid race authority version configuration");
+    if (race_validator_ && publish_tf_) throw std::invalid_argument("Private race validator cannot publish TF");
     use_prior_ = declare_parameter<bool>("use_prior_tracking", false);
     capture_inputs_ = declare_parameter<bool>("publish_attempt_inputs", false);
     selected_input_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("selected_cloud",rclcpp::QoS(2).reliable());
@@ -175,10 +189,14 @@ class NavigationLocalizer : public rclcpp::Node {
       initializer_->load(seed_file, map_frame_, base_frame_);
       RCLCPP_WARN(get_logger(), "REGION_INIT enabled profile=%s confirmations=%d; exact snapshot TF required", seed_file.c_str(), init.confirm_windows);
     }
+    candidate_source_=declare_parameter<std::string>("candidate_source","keyframes");
+    if(candidate_source_!="keyframes" && candidate_source_!="bbs") throw std::invalid_argument("Unsupported candidate source");
     keyframes_enabled_=declare_parameter<bool>("keyframe_initialization_enabled",false);
+    if(candidate_source_=="bbs" && !keyframes_enabled_) throw std::invalid_argument("BBS requires candidate packet validation");
     hierarchy_enabled_=declare_parameter<bool>("hierarchical_initialization_enabled",false);
     hierarchy_confidence_=declare_parameter<double>("hierarchical_min_initial_overlap",80.0);
     if(!std::isfinite(hierarchy_confidence_) || hierarchy_confidence_<60 || hierarchy_confidence_>100)throw std::invalid_argument("invalid hierarchical confidence overlap");
+    if(candidate_source_=="bbs" && hierarchy_enabled_) throw std::invalid_argument("BBS competitors must all be refined; hierarchical screening is not allowed");
     if(hierarchy_enabled_ && !keyframes_enabled_) throw std::invalid_argument("Hierarchical trial requires keyframe candidate packet validation");
     keyframe_region_id_=declare_parameter<int>("keyframe_region_id",2);
     keyframe_expected_=declare_parameter<int>("keyframe_expected_candidates",28);
@@ -188,7 +206,10 @@ class NavigationLocalizer : public rclcpp::Node {
       if(!multistart_enabled_ || keyframe_expected_<1 || keyframe_expected_>64 || keyframe_library_sha_.size()!=64 || keyframe_profile_sha_.size()!=64)
         throw std::invalid_argument("Keyframes require multistart and verified library/profile hashes");
       keyframe_map_sha_=fileSha256(map_pcd);
-      RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
+      if(candidate_source_=="bbs")
+        RCLCPP_WARN(get_logger(),"BBS_INIT experimental, dynamic competing map-search peaks; no fixed entrance or keyframe position lookup; all retained peaks require VGICP/ambiguity/two windows");
+      else
+        RCLCPP_WARN(get_logger(),"KEYFRAME_INIT experimental, all database candidates; existing entrance box is replaced by 1m/30deg reference candidate support, NOT unrestricted full-building initialization");
     }
     loadMap(map_pcd);
     if (!initial_region.empty()) setRegionHint(initial_region);
@@ -293,9 +314,9 @@ class NavigationLocalizer : public rclcpp::Node {
     rclcpp::QoS status_qos(1);
     status_qos.reliable().transient_local();
     status_pub_ = create_publisher<Result>("status", status_qos);
-    permission_pub_ = create_publisher<std_msgs::msg::Bool>(
+    if (!race_validator_) permission_pub_ = create_publisher<std_msgs::msg::Bool>(
         "/localization/navigation_allowed", rclcpp::QoS(1).reliable());
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    if(publish_tf_) tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -337,11 +358,33 @@ class NavigationLocalizer : public rclcpp::Node {
           }
         }, service_qos, registration_group_);
 
+    rclcpp::SubscriptionOptions race_options;race_options.callback_group=registration_group_;
+    if (race_validator_) race_control_sub_ = create_subscription<std_msgs::msg::UInt64>(
+        "/localization/race_control", rclcpp::QoS(1).reliable().transient_local(),
+        [this](std_msgs::msg::UInt64::ConstSharedPtr m) {
+          if(m->data && m->data!=race_generation_) {
+            setRegionHint("space_2");
+            {std::lock_guard<std::mutex> lock(input_mutex_);latest_keyframes_.reset();}
+            {std::lock_guard<std::mutex> lock(state_mutex_);has_applied_=false;last_apply_wall_.reset();}
+          }
+          race_generation_=m->data;
+        }, race_options);
+    if (external_initialization_) race_service_ = create_service<kiss_matcher_localization::srv::RaceInitialization>(
+        "race_initialization", [this](const std::shared_ptr<kiss_matcher_localization::srv::RaceInitialization::Request> request,
+        std::shared_ptr<kiss_matcher_localization::srv::RaceInitialization::Response> response) {
+          if(request->submit) {
+            race_proposal_=*request;
+            response->result=runLocalization(true);
+            response->result.completed_stamp=get_clock()->now();status_pub_->publish(response->result);
+          }
+          response->epoch=race_epoch_;response->waiting=race_waiting_;
+        }, service_qos, registration_group_);
+
     trigger_timer_ = create_wall_timer(
         std::chrono::milliseconds(100), [this]() { triggerAutomatically(); }, registration_group_);
     tf_timer_ = create_wall_timer(
         std::chrono::milliseconds(100), [this]() { publishTf(); }, tf_group_);
-    permission_timer_ = create_wall_timer(
+    if (!race_validator_) permission_timer_ = create_wall_timer(
         std::chrono::milliseconds(200), [this]() { publishNavigationPermission(); }, tf_group_);
   }
 
@@ -355,7 +398,20 @@ class NavigationLocalizer : public rclcpp::Node {
   };
 
   void loadMap(const std::string &path) {
-    region_map_.load(path, region_labels_csv_, voxel_resolution_);
+    const auto cache=declare_parameter<std::string>("map_cache_directory", "");
+    if(cache.empty())region_map_.load(path, region_labels_csv_, voxel_resolution_);
+    else {
+      std::ifstream meta(cache+"/source.txt");std::string source_sha;double voxel;
+      if(!(meta>>source_sha>>voxel) || source_sha!=fileSha256(path) || std::abs(voxel-voxel_resolution_)>1e-9)
+        throw std::runtime_error("Map cache source/voxel mismatch");
+      std::ifstream checks(cache+"/checksums.txt");std::string name,digest;std::size_t verified=0;
+      while(checks>>name>>digest) {
+        if(name.find('/')!=std::string::npos || name.find("..")!=std::string::npos || fileSha256(cache+"/"+name)!=digest)throw std::runtime_error("Map cache content mismatch");
+        ++verified;
+      }
+      if(verified<2)throw std::runtime_error("Map cache checksums missing");
+      region_map_.loadCache(cache,region_labels_csv_);
+    }
     map_cloud_ = region_map_.full();
     RCLCPP_INFO(get_logger(), "Global map loaded: path=%s frame=%s points=%zu -> %zu voxel=%.3fm region_id=%s skipped=%zu",
         path.c_str(), map_frame_.c_str(), region_map_.rawPoints(), map_cloud_->size(), voxel_resolution_,
@@ -367,6 +423,7 @@ class NavigationLocalizer : public rclcpp::Node {
   void setRegionHint(const std::string &hint) {
     const int id = region_map_.resolveHint(hint);  // Validate before changing current state.
     active_region_id_ = id;
+    last_bbs_query_stamp_=0;
     if (initializer_) initializer_->reset();
     recovering_candidates_=false;initialization_reference_ns_=0;
     force_global_next_ = true;
@@ -401,7 +458,7 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   kiss_matcher::LocalizationResult alignInitialized(const pcl::PointCloud<Point> &source) {
-    attempt_mode_ = keyframe_attempt_ ? "keyframe_multistart" : "region_multistart";
+    attempt_mode_ = keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_multistart" : "keyframe_multistart") : "region_multistart";
     attempt_region_id_=active_region_id_;
     const auto started=Clock::now();
     const pcl::PointCloud<Point> *target=map_cloud_.get();
@@ -422,14 +479,14 @@ class NavigationLocalizer : public rclcpp::Node {
     } else {
       for(const auto &[id,guess]:guesses) {
         auto registration=registration_->alignWithPrior(source,*target,guess,initializer_->config().crop_margin);
-        candidates.push_back(initializer_->evaluate(id,keyframe_attempt_ ? "keyframe_vgicp" : "seed_vgicp",registration,initialization_odom_,guess,!keyframe_attempt_));
+        candidates.push_back(initializer_->evaluate(id,keyframe_attempt_ ? (candidate_source_=="bbs" ? "bbs_vgicp" : "keyframe_vgicp") : "seed_vgicp",registration,initialization_odom_,guess,!keyframe_attempt_));
       }
       seed_candidates_=candidates.size();
     }
     initialization_decision_=initializer_->decide(candidates,initialization_stamp_,initialization_odom_);
     if(hierarchy_blocked){initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=hierarchy_reason;}
-    if(keyframe_attempt_ && hierarchy_enabled_ && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
-      initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason="hierarchy_low_confidence";
+    if(keyframe_attempt_ && (hierarchy_enabled_ || candidate_source_=="bbs") && initialization_decision_.selected>=0 && candidates[initialization_decision_.selected].registration.overlap_percent<hierarchy_confidence_){
+      initializer_->resetConfirmation();initialization_decision_.ready=false;initialization_decision_.selected=-1;initialization_decision_.confirmations=0;initialization_decision_.reason=candidate_source_=="bbs" ? "bbs_low_confidence" : "hierarchy_low_confidence";
     }
     initialization_selected_seed_.clear();
     kiss_matcher::LocalizationResult selected;
@@ -587,16 +644,60 @@ class NavigationLocalizer : public rclcpp::Node {
     input_capture_pub_->publish(capture);
   }
 
+  void openRace() {
+    if(!external_initialization_ || race_waiting_) return;
+    race_waiting_=true;++race_epoch_;race_start_ns_=get_clock()->now().nanoseconds();
+  }
+
+  Result adoptRace() {
+    auto request=*race_proposal_;race_proposal_.reset();
+    Result result=newResult();attempt_mode_="race_"+request.source;
+    auto reject=[&](const std::string &why){result.reason=why;return result;};
+    if(!race_waiting_ || request.epoch!=race_epoch_) return reject("race_epoch_closed_or_changed");
+    const auto expected=request.source=="bbs" ? race_bbs_sha_ : (request.source=="keyframes" ? race_keyframes_sha_ : "");
+    if(expected.empty() || request.library_sha256!=expected || request.map_sha256!=race_map_sha_ || request.profile_sha256!=(request.source=="bbs" ? race_bbs_profile_sha_ : race_profile_sha_))
+      return reject("race_version_or_source_mismatch");
+    const auto &p=request.proposal;
+    const auto stamp=rclcpp::Time(p.local_map_stamp).nanoseconds();
+    const double age=(get_clock()->now().nanoseconds()-stamp)/1e9;
+    if(stamp<race_start_ns_ || age<0 || age>max_local_map_age_sec_ || !p.matched || !p.applied || p.reason!="applied" || !std::isfinite(p.overlap_percent) || p.overlap_percent<80)
+      return reject("race_proposal_unconfirmed_or_expired");
+    const auto &t=p.candidate_map_to_odom;
+    if(t.header.frame_id!=map_frame_ || t.child_frame_id!=odom_frame_)return reject("race_frame_mismatch");
+    Eigen::Quaterniond q(t.transform.rotation.w,t.transform.rotation.x,t.transform.rotation.y,t.transform.rotation.z);
+    Eigen::Matrix4d candidate=Eigen::Matrix4d::Identity();
+    candidate.block<3,1>(0,3)=Eigen::Vector3d(t.transform.translation.x,t.transform.translation.y,t.transform.translation.z);
+    if(!q.coeffs().allFinite() || std::abs(q.norm()-1)>1e-5 || !candidate.allFinite())return reject("race_invalid_transform");
+    candidate.block<3,3>(0,0)=q.normalized().toRotationMatrix();
+    try {
+      const auto ob=snapshotOdom(p.local_map_stamp);
+      bool previous;Eigen::Matrix4d old;
+      {std::lock_guard<std::mutex> lock(state_mutex_);previous=has_applied_;old=applied_map_T_odom_;}
+      result=p;result.applied=false;result.has_previous=previous;result.candidate_id.clear();
+      if(previous) {
+        Eigen::Matrix4d delta=(old*ob).inverse()*(candidate*ob);
+        result.translation_delta_m=delta.block<3,1>(0,3).norm();result.rotation_delta_deg=rotationDegrees(delta.block<3,3>(0,0));result.delta_valid=true;
+        if(result.translation_delta_m>max_auto_translation_m_ || result.rotation_delta_deg>max_auto_rotation_deg_)return reject("race_jump_exceeds_limit");
+      }
+      if(apply(candidate,result)) {race_waiting_=false;result.reason="applied";}
+      // Refinement ran in the private validator, not again in this owner.
+      diagnostics_.fine_ran=true;result.completed_stamp=get_clock()->now();
+      return result;
+    } catch(const std::exception &e) {return reject(std::string("race_snapshot_unavailable: ")+e.what());}
+  }
+
   Result runLocalizationImpl(bool apply_if_safe) {
+    if(external_initialization_ && race_proposal_) return adoptRace();
     pending_.reset();
     if(multistart_enabled_) {
       bool reset=false;
       {std::lock_guard<std::mutex> lock(input_mutex_);reset=input_time_reset_;input_time_reset_=false;}
       if(reset) {
-        initializer_->reset();initialization_reference_ns_=0;
+        initializer_->reset();initialization_reference_ns_=0;last_bbs_query_stamp_=0;
         std::lock_guard<std::mutex> lock(state_mutex_);
         has_applied_=false;recovering_candidates_=false;last_apply_wall_.reset();applied_map_T_odom_.setIdentity();
         force_global_next_=true;
+        if(external_initialization_){race_waiting_=false;openRace();}
         RCLCPP_WARN(get_logger(),"REGION_INIT input time reset; discarded applied transform and confirmation history");
       }
     }
@@ -620,6 +721,9 @@ class NavigationLocalizer : public rclcpp::Node {
         std::chrono::duration<double>(Clock::now() - *last_apply_wall_).count() < prior_max_age_;
       prior = applied_map_T_odom_;
     }
+    if(external_initialization_ && !try_prior) {
+      openRace();result.reason="external_initialization_pending";return result;
+    }
     if (!try_prior && keyframes_enabled_ && has_applied_ && active_region_id_<0 && !recovering_candidates_) {
       recovering_candidates_=true;initializer_->reset();initialization_reference_ns_=0;
     }
@@ -630,11 +734,22 @@ class NavigationLocalizer : public rclcpp::Node {
     keyframe_attempt_=false;keyframe_guesses_.clear();
     if(keyframes_enabled_ && !try_prior && (active_region_id_==keyframe_region_id_ || (active_region_id_<0 && recovering_candidates_))) {
       Keyframes::ConstSharedPtr m;{std::lock_guard<std::mutex> lock(input_mutex_);m=latest_keyframes_;}
-      if(!m || !m->ready) {result.reason="keyframe_query_unavailable";initializer_->resetConfirmation();return result;}
+      if(!m || !m->ready) {
+        result.reason="keyframe_query_unavailable";
+        const std::set<std::string> temporary={"no_short_cloud","short_cloud_warmup","query_odom_missing","estimated_gravity_missing_at_query_stamp","bbs_search_pending"};
+        if(m && m->region_id==keyframe_region_id_ && m->map_sha256==keyframe_map_sha_ &&
+            m->library_sha256==keyframe_library_sha_ && m->profile_sha256==keyframe_profile_sha_ &&
+            m->cloud.header.frame_id==odom_frame_ && temporary.count(m->reason)) {
+          initialization_decision_.confirmations=initializer_->waitForQuery(get_clock()->now().nanoseconds());
+          initialization_decision_.reason="initialization_wait_query";
+          RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,"INIT_WAIT query=%s confirmations=%d; no new match, time limit still enforced",m->reason.c_str(),initialization_decision_.confirmations);
+        } else initializer_->resetConfirmation();
+        return result;
+      }
       if(m->map_sha256!=keyframe_map_sha_ || m->library_sha256!=keyframe_library_sha_ || m->profile_sha256!=keyframe_profile_sha_ || m->region_id!=keyframe_region_id_) {
         result.reason="keyframe_version_or_region_mismatch";initializer_->resetConfirmation();return result;
       }
-      if(m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
+      if((candidate_source_=="bbs" ? (m->map_to_odom.empty() || m->map_to_odom.size()>static_cast<std::size_t>(keyframe_expected_) || m->reason!="bbs_competitors_complete") : m->map_to_odom.size()!=static_cast<std::size_t>(keyframe_expected_)) || m->window_start_ns==0 || rclcpp::Time(m->cloud.header.stamp).nanoseconds()<static_cast<std::int64_t>(m->window_start_ns) ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9<0.8 ||
           (rclcpp::Time(m->cloud.header.stamp).nanoseconds()-m->window_start_ns)/1e9>1.05 || m->ids.size()!=m->map_to_odom.size() || m->scores.size()!=m->ids.size()) {
         result.reason="keyframe_candidate_shape_invalid";initializer_->resetConfirmation();return result;
@@ -670,6 +785,17 @@ class NavigationLocalizer : public rclcpp::Node {
       return result;
     }
 
+    if(keyframe_attempt_ && candidate_source_=="bbs") {
+      const auto stamp=rclcpp::Time(snapshot->header.stamp).nanoseconds();
+      if(last_bbs_query_stamp_ && stamp<=last_bbs_query_stamp_) {
+        result.reason=stamp==last_bbs_query_stamp_ ? "keyframe_query_already_processed" : "bbs_query_out_of_order";
+        if(stamp==last_bbs_query_stamp_) {
+          initialization_decision_.confirmations=initializer_->waitForQuery(get_clock()->now().nanoseconds());
+          initialization_decision_.reason="initialization_wait_query";
+        } else initializer_->resetConfirmation();
+        return result;
+      }
+    }
     force_global_next_ = false;
     try {
       captureInput(*snapshot, keyframe_attempt_ ? "keyframe" : (try_prior ? "prior" : "global"), snapshot_topic);
@@ -705,8 +831,10 @@ class NavigationLocalizer : public rclcpp::Node {
         result.registration_ms=std::chrono::duration<double,std::milli>(Clock::now()-start).count();
         diagnostics_=registration;result.overlap_percent=registration.overlap_percent;
         result.reason="prior_registration_rejected";pending_.reset();
+        if(external_initialization_){force_global_next_=true;openRace();}
+        if(candidate_source_=="bbs") last_bbs_query_stamp_=rclcpp::Time(snapshot->header.stamp).nanoseconds();
         if(keyframes_enabled_){recovering_candidates_=true;force_global_next_=true;initializer_->reset();initialization_reference_ns_=0;}
-        RCLCPP_WARN(get_logger(),"Prior VGICP rejected; no coarse fallback. Next fresh input uses %s",keyframes_enabled_?"database candidates with two-window confirmation":"prior VGICP until expiry; then explicit reinitialization required");
+        RCLCPP_WARN(get_logger(),"Prior VGICP rejected; no coarse fallback. Next fresh input uses %s",external_initialization_?"BBS + keyframes race with independent two-window confirmation":(keyframes_enabled_?"database candidates with two-window confirmation":"prior VGICP until expiry; then explicit reinitialization required"));
         return result;
       }
       if (!try_prior) {
@@ -723,6 +851,7 @@ class NavigationLocalizer : public rclcpp::Node {
             return result;
           }
         }
+        if(keyframe_attempt_ && candidate_source_=="bbs") last_bbs_query_stamp_=initialization_stamp_;
         registration = alignInitialized(sampled);
         RCLCPP_INFO(get_logger(), "Registration mode: %s", attempt_mode_.c_str());
       } else {
@@ -890,6 +1019,11 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   void triggerAutomatically() {
+    if(race_validator_ && !race_generation_) return;
+    if(external_initialization_ && race_waiting_) {
+      std::lock_guard<std::mutex> lock(input_mutex_);
+      if(!input_time_reset_) return; // Waiting is not a registration attempt; do not inflate metrics.
+    }
     const auto now = Clock::now();
     bool initialized;
     {
@@ -910,6 +1044,7 @@ class NavigationLocalizer : public rclcpp::Node {
   }
 
   void publishTf() {
+    if(!publish_tf_)return;
     std::scoped_lock lock(input_mutex_, state_mutex_);
     if (!has_applied_ || (multistart_enabled_ && input_time_reset_)) return;
     const Eigen::Matrix4d pose = applied_map_T_odom_;
@@ -965,6 +1100,13 @@ class NavigationLocalizer : public rclcpp::Node {
     }
   }
 
+  bool publish_tf_=true,race_validator_=false,external_initialization_=false,race_waiting_=true;
+  std::uint64_t race_epoch_=1,race_generation_=0;
+  std::int64_t race_start_ns_=0;
+  std::string race_map_sha_,race_keyframes_sha_,race_bbs_sha_,race_profile_sha_,race_bbs_profile_sha_;
+  std::optional<kiss_matcher_localization::srv::RaceInitialization::Request> race_proposal_;
+  rclcpp::Service<kiss_matcher_localization::srv::RaceInitialization>::SharedPtr race_service_;
+  rclcpp::Subscription<std_msgs::msg::UInt64>::SharedPtr race_control_sub_;
   std::string map_frame_;
   std::string odom_frame_;
   std::string base_frame_;
@@ -975,13 +1117,13 @@ class NavigationLocalizer : public rclcpp::Node {
   double max_auto_translation_m_ = 1.0;
   double max_auto_rotation_deg_ = 15.0;
   double candidate_timeout_sec_ = 60.0;
+
   double permission_max_success_age_sec_ = 5.0;
   double permission_max_local_map_age_sec_ = 2.5;
   double permission_max_odom_age_sec_ = 0.5;
   int permission_max_consecutive_failures_ = 3;
   int consecutive_failures_ = 0;  // guarded by state_mutex_
   std::optional<bool> last_permission_;
-
   bool multistart_enabled_ = false, initialization_tf_valid_ = false;
   bool input_time_reset_ = false;  // guarded by input_mutex_
   double initialization_tf_timeout_ = 0.2;
@@ -1002,6 +1144,8 @@ class NavigationLocalizer : public rclcpp::Node {
   pcl::PointCloud<Point>::Ptr map_cloud_;
   kiss_matcher::RegionMap region_map_;
   std::string region_labels_csv_;
+  std::string candidate_source_;
+  std::int64_t last_bbs_query_stamp_=0;
   bool keyframes_enabled_=false,keyframe_attempt_=false;
   std::string keyframe_map_sha_,keyframe_library_sha_,keyframe_profile_sha_;
   int keyframe_region_id_=2,keyframe_expected_=28;

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -156,6 +157,31 @@ void RegionMap::load(const std::string &pcd, const std::string &labels_csv, doub
     entry.name = labels.count(id) ? labels.at(id) : std::to_string(id);
     entry.cloud = downsample(entry.cloud, voxel);
   }
+}
+
+void RegionMap::saveCache(const std::string &directory) const {
+  std::filesystem::create_directories(directory);
+  if(pcl::io::savePCDFileBinary(directory+"/full.pcd",*full_)<0)throw std::runtime_error("Cannot write full map cache");
+  std::ofstream meta(directory+"/regions.txt");meta<<raw_points_<<' '<<skipped_points_<<'\n';
+  for(const auto &[id,entry]:regions_) {
+    meta<<id<<' '<<entry.raw_points<<'\n';
+    if(pcl::io::savePCDFileBinary(directory+"/region_"+std::to_string(id)+".pcd",*entry.cloud)<0)throw std::runtime_error("Cannot write region cache");
+  }
+  if(!meta)throw std::runtime_error("Cannot write region cache metadata");
+}
+void RegionMap::loadCache(const std::string &directory,const std::string &labels_csv) {
+  auto labels=readLabels(labels_csv);std::ifstream meta(directory+"/regions.txt");
+  if(!(meta>>raw_points_>>skipped_points_))throw std::runtime_error("Invalid cached region metadata");
+  full_.reset(new pcl::PointCloud<pcl::PointXYZI>());
+  if(pcl::io::loadPCDFile(directory+"/full.pcd",*full_)<0 || full_->empty())throw std::runtime_error("Invalid full map cache");
+  regions_.clear();int id;std::size_t count;
+  while(meta>>id>>count) {
+    if(id<0 || regions_.count(id))throw std::runtime_error("Invalid cached region ID");
+    auto &entry=regions_[id];entry.raw_points=count;entry.name=labels.count(id)?labels.at(id):std::to_string(id);
+    entry.cloud.reset(new pcl::PointCloud<pcl::PointXYZI>());
+    if(pcl::io::loadPCDFile(directory+"/region_"+std::to_string(id)+".pcd",*entry.cloud)<0 || entry.cloud->empty())throw std::runtime_error("Invalid region cache cloud");
+  }
+  has_labels_=!regions_.empty();
 }
 
 const MapRegion &RegionMap::region(int id) const {

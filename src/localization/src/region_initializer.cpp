@@ -60,7 +60,9 @@ void RegionInitializer::load(const std::string &file, const std::string &map_fra
     bounds("rpy_min_deg","rpy_max_deg",region.rpy_min,region.rpy_max);
     if (region.rpy_min && ((region.rpy_min->array() < -180).any() || (region.rpy_max->array() > 180).any()))
       throw std::invalid_argument("RPY bounds must lie in [-180,180]");
-    if (!entry["seeds"].IsSequence() || entry["seeds"].size() == 0 ||
+    const bool dynamic_only = entry["dynamic_candidates_only"] && entry["dynamic_candidates_only"].as<bool>();
+    if (!entry["seeds"].IsSequence() || (!dynamic_only && entry["seeds"].size() == 0) ||
+        (dynamic_only && entry["seeds"].size() != 0) ||
         entry["seeds"].size() > static_cast<std::size_t>(config_.max_candidates))
       throw std::invalid_argument("empty/excessive region seeds");
     std::set<std::string> names;

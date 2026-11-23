@@ -1,0 +1,7 @@
+schema_version: 1
+map_frame: map
+base_frame: base_link
+regions:
+- region_id: 10
+  dynamic_candidates_only: true
+  seeds: []

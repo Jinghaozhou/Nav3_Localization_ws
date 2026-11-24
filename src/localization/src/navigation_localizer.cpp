@@ -108,6 +108,8 @@ class NavigationLocalizer : public rclcpp::Node {
     max_auto_rotation_deg_ = declare_parameter<double>("max_auto_rotation_deg", 15.0);
     candidate_timeout_sec_ = declare_parameter<double>("candidate_timeout_sec", 60.0);
 
+    permission_allow_after_initialization_ =
+        declare_parameter<bool>("navigation_permission.allow_after_initialization", true);
     permission_max_success_age_sec_ = declare_parameter<double>("navigation_permission.max_success_age_sec", 5.0);
     permission_max_local_map_age_sec_ = declare_parameter<double>("navigation_permission.max_local_map_age_sec", 2.5);
     permission_max_odom_age_sec_ = declare_parameter<double>("navigation_permission.max_odom_age_sec", 0.5);
@@ -120,7 +122,7 @@ class NavigationLocalizer : public rclcpp::Node {
       timing_csv_.open(path);
       if (!timing_csv_) throw std::runtime_error("cannot open timing_diagnostics_csv: " + timing_csv);
       timing_csv_ << "event,steady_ns,ros_ns,map_stamp_ns,points,map_receive_steady_ns,"
-                     "map_receive_ros_ns,tf_stamp_ns,applied,success_fresh,failures_ok,map_fresh,odom_fresh\n";
+                     "map_receive_ros_ns,tf_stamp_ns,applied,success_fresh,failures_ok,map_fresh,odom_fresh,allowed\n";
       RCLCPP_INFO(get_logger(), "Localization timing CSV: %s", timing_csv.c_str());
     }
     if (map_pcd.empty() || map_frame_.empty() || odom_frame_.empty() ||
@@ -1132,7 +1134,9 @@ class NavigationLocalizer : public rclcpp::Node {
       }
     }
     std_msgs::msg::Bool permission;
-    permission.data = applied && success_fresh && failures_ok && map_fresh && odom_fresh;
+    const bool strict_permission =
+        applied && success_fresh && failures_ok && map_fresh && odom_fresh;
+    permission.data = applied && (permission_allow_after_initialization_ || strict_permission);
     permission_pub_->publish(permission);
     if (timing_csv_) {
       std::lock_guard<std::mutex> lock(timing_csv_mutex_);
@@ -1140,11 +1144,13 @@ class NavigationLocalizer : public rclcpp::Node {
                   << ',' << map_stamp_ns << ',' << map_points << ',' << map_receive_steady_ns
                   << ',' << map_receive_ros_ns << ',' << tf_stamp_ns << ','
                   << applied << ',' << success_fresh << ',' << failures_ok << ','
-                  << map_fresh << ',' << odom_fresh << '\n' << std::flush;
+                  << map_fresh << ',' << odom_fresh << ',' << permission.data << '\n' << std::flush;
     }
     if (!last_permission_ || *last_permission_ != permission.data) {
-      RCLCPP_INFO(get_logger(), "Navigation permission %s: applied=%s success_fresh=%s failures_ok=%s map_fresh=%s odom_fresh=%s",
-          permission.data ? "GRANTED" : "DENIED", applied ? "true" : "false",
+      RCLCPP_INFO(get_logger(), "Navigation permission %s: after_initialization=%s applied=%s success_fresh=%s failures_ok=%s map_fresh=%s odom_fresh=%s",
+          permission.data ? "GRANTED" : "DENIED",
+          permission_allow_after_initialization_ ? "true" : "false",
+          applied ? "true" : "false",
           success_fresh ? "true" : "false", failures_ok ? "true" : "false",
           map_fresh ? "true" : "false", odom_fresh ? "true" : "false");
       last_permission_ = permission.data;
@@ -1170,6 +1176,7 @@ class NavigationLocalizer : public rclcpp::Node {
   double candidate_timeout_sec_ = 60.0;
 
   double permission_max_success_age_sec_ = 5.0;
+  bool permission_allow_after_initialization_ = true;
   double permission_max_local_map_age_sec_ = 2.5;
   double permission_max_odom_age_sec_ = 0.5;
   int permission_max_consecutive_failures_ = 3;

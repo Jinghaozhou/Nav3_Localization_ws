@@ -21,7 +21,9 @@
     use_prior_tracking: true
     prior_crop_margin_m: 5.0
     prior_max_age_sec: 30.0
-    # Permission is a 5 Hz fail-closed Bool for SCAN; TF availability alone is insufficient.
+    # Before the first applied localization permission is false; afterward it is true by default.
+    # Set false to restore the strict freshness and failure checks below.
+    navigation_permission.allow_after_initialization: true
     navigation_permission.max_success_age_sec: 5.0
     navigation_permission.max_local_map_age_sec: 2.5
     navigation_permission.max_odom_age_sec: 0.5

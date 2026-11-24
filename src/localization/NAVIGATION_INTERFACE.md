@@ -66,12 +66,13 @@ ros2 service call /localization/accept_candidate \
 使用 `overlap_percent`、`registration_ms`、时间戳和 `candidate_id`
 监控当前行为。
 
-导航许可要求：已成功应用全局定位；最近一次应用未超过
+默认 `navigation_permission.allow_after_initialization=true`：首次成功应用全局定位前许可为 false，之后只要该定位状态未被重置就持续发布 true。局部地图、TF、新近匹配和失败次数仍写入诊断记录，但在此模式下不撤销许可。输入时间重置或主动重置定位状态后，许可重新变为 false。此模式用于联调，不能把许可为 true 解读为当前 TF 或传感器数据新鲜。
+
+设置 `navigation_permission.allow_after_initialization=false` 可恢复严格模式：最近一次应用未超过
 `navigation_permission.max_success_age_sec`（默认 5 秒）；连续未匹配次数小于
 `navigation_permission.max_consecutive_failures`（默认 3）；`odom` 中的非空局部地图
 及 `odom → base_link` TF 分别未超过 2.5 秒和 0.5 秒。局部地图同时按消息时间戳和
-本机接收时间检查。偶发一次匹配失败不会立即撤销许可；超时、输入时间回跳或
-节点停止发布时许可失效。`map → odom` 仍可供诊断查询，不能单独用其新鲜度
+本机接收时间检查。`map → odom` 仍可供诊断查询，不能单独用其新鲜度
 判断定位可靠。SCAN 联调时设置 `require_localization_permission:=true`，并将
 `localization_permission_topic` 指向 `/localization/navigation_allowed`；SCAN 的
 许可订阅超过 1 秒没有更新也会停车。

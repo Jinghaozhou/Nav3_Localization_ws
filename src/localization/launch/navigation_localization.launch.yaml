@@ -23,6 +23,8 @@ launch:
   - arg: {name: record_inputs, default: "false", description: "Publish exact input snapshots for rosbag"}
   - arg: {name: external_initialization_enabled, default: "false"}
   - arg: {name: race_bbs_sha256, default: ""}
+  - arg: {name: race_virtual_sha256, default: ""}
+  - arg: {name: race_virtual_profile_sha256, default: ""}
   - arg: {name: race_keyframes_sha256, default: ""}
   - arg: {name: race_profile_sha256, default: ""}
   - arg: {name: race_bbs_profile_sha256, default: ""}
@@ -37,6 +39,8 @@ launch:
       param:
         - {name: external_initialization_enabled, value: $(var external_initialization_enabled), type: bool}
         - {name: race_bbs_sha256, value: $(var race_bbs_sha256), type: str}
+        - {name: race_virtual_sha256, value: $(var race_virtual_sha256), type: str}
+        - {name: race_virtual_profile_sha256, value: $(var race_virtual_profile_sha256), type: str}
         - {name: race_keyframes_sha256, value: $(var race_keyframes_sha256), type: str}
         - {name: race_profile_sha256, value: $(var race_profile_sha256), type: str}
         - {name: race_bbs_profile_sha256, value: $(var race_bbs_profile_sha256), type: str}
